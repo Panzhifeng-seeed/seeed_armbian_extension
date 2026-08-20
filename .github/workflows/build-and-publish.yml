@@ -192,9 +192,8 @@ jobs:
         include:
           - name: camera-engine-rkaiq-rk3588
             soc: rk3588
-          # rk3576: build-cross.sh supports it, enable after board
-          # verification (closed-source .a set for ISP39 needs a test
-          # run first).
+          - name: camera-engine-rkaiq-rk3576
+            soc: rk3576
     steps:
       - name: Checkout
         uses: actions/checkout@v4
