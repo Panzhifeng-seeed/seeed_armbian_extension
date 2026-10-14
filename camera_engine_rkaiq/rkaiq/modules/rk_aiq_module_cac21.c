@@ -303,6 +303,14 @@ static void cac21_multi_cvt(struct isp32_cac_cfg* phwcfg, cac_params_dyn_t* pdyn
 
     int index = (int)is_multi_isp;
     XCamReturn ret = rk_aiq_cac21_update_lut(cacInfo, psta->psfParam.sw_cacT_psfMap_path);
+    if (cacInfo->current_lut_[0] == NULL ||
+            (index > 0 && cacInfo->current_lut_[index] == NULL)) {
+        // no hw lut available (hw buffer import failed or psf file missing):
+        // bypass CAC instead of dereferencing the NULL current_lut_
+        phwcfg->bypass_en = true;
+        LOGW_ACAC("%s: CAC hw lut unavailable, bypass\n", __FUNCTION__);
+        return;
+    }
     if (ret != XCAM_RETURN_NO_ERROR) {
         // buf_fd should be valid if enabled, or will cause iommu error
         phwcfg->bypass_en = true;

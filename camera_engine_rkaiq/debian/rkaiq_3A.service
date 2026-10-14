@@ -10,7 +10,14 @@ ExecStart=/usr/bin/rkaiq_3A_server
 # non-root cgroups fails with EPERM regardless of capabilities, which leaves
 # AEC without stats and the sensor stuck at minimum exposure (black frames).
 # Migrate the daemon into the root cgroup where RT scheduling is allowed.
-ExecStartPost=/bin/sh -c 'echo $MAINPID > /sys/fs/cgroup/cgroup.procs 2>/dev/null || true'
+# The single write races with systemd's early-boot cgroup setup and can
+# silently fail (leaving the daemon in its service cgroup, AEC without
+# stats, black frames), so retry until /proc/$MAINPID/cgroup reports the
+# root cgroup. cgroup v1 systems (no unified /sys/fs/cgroup/cgroup.procs)
+# skip the migration entirely: the RT-in-non-root-cgroup restriction is
+# v2-only, so nested RT threads are permitted there and the daemon works
+# without migration.
+ExecStartPost=/bin/sh -c '[ -f /sys/fs/cgroup/cgroup.procs ] && [ -n "$MAINPID" ] || exit 0; i=0; while [ $i -lt 100 ]; do echo $MAINPID > /sys/fs/cgroup/cgroup.procs 2>/dev/null; grep -q "0::/$" /proc/$MAINPID/cgroup 2>/dev/null && break; i=$((i+1)); sleep 0.1; done'
 Restart=on-failure
 RestartSec=2
 
