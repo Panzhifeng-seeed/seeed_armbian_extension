@@ -1,0 +1,541 @@
+name: "Images - Build matrix"
+
+on:
+  workflow_dispatch:
+    inputs:
+      # ── Build source (which repo:branch to build from).
+      armbian_build_repo:
+        description: "armbian-build source (repo:branch; repo must be <owner>/armbian-build)"
+        required: false
+        type: string
+        default: "armbian-build:main"
+
+      # ── Boards (all on by default; missing boards are skipped in plan).
+      # Input names ARE the board ids — plan derives the list from
+      # toJSON(inputs); adding a board is one input here, nothing else.
+      recomputer-rk3576-devkit:
+        description: "Board: reComputer rk3576 DevKit"
+        type: boolean
+        default: true
+      recomputer-rk3576-module-devkit:
+        description: "Board: reComputer rk3576 Module DevKit"
+        type: boolean
+        default: true
+      recomputer-rk3576-industrial:
+        description: "Board: reComputer rk3576 Industrial"
+        type: boolean
+        default: true
+      recomputer-rk3588-devkit:
+        description: "Board: reComputer rk3588 DevKit"
+        type: boolean
+        default: true
+
+      # ── Variants (always both): cli → Debian 13 trixie (--minimal);
+      #    gnome → Ubuntu 26.04 resolute (desktop, sized by desktop_tier).
+
+      # ── OTA modes (each becomes a matrix entry). recovery mandatory; ab opt-in.
+      ota_ab:
+        description: "OTA: A/B dual-partition"
+        type: boolean
+        default: false
+
+      # ── Security. plain mandatory; secure-boot opt-in.
+      secure_boot:
+        description: "Security: secure-boot"
+        type: boolean
+        default: false
+
+      # ── Other options
+      desktop_tier:
+        description: "Desktop tier size"
+        required: true
+        type: choice
+        options:
+          - minimal
+          - mid
+          - full
+        default: mid
+
+env:
+  PRIVATE_CCACHE: "yes"
+  USE_CCACHE: "yes"
+  ENABLE_SEEED_RK_EXTENSION: "yes"
+  KERNEL_CONFIGURE: "no"
+  VENDOR: "Armbian"
+  DOCKER_IMAGE: "ghcr.io/armbian/docker-armbian-build:armbian-ubuntu-noble-latest"
+
+concurrency:
+  group: images-build
+  cancel-in-progress: false
+
+jobs:
+  # secrets.* not allowed in step-level if:, so probe it once here.
+  preflight:
+    # Fail fast on malformed secrets BEFORE the multi-hour build.
+    needs: probe-secrets
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    env:
+      HAS_RCLONE: ${{ needs.probe-secrets.outputs.has_rclone }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup rclone (seeed-storage OneDrive remote)
+        if: ${{ env.HAS_RCLONE == 'true' }}
+        uses: ./.github/actions/setup-onedrive
+        with:
+          rclone_config: ${{ secrets.RCLONE_CONFIG }}
+
+      - name: Check OneDrive mirror availability (hard gate)
+        if: ${{ env.HAS_RCLONE == 'true' }}
+        run: |
+          set -euo pipefail
+          if ! rclone lsd seeed-storage:armbian/images --max-depth 1 --contimeout 15s >/dev/null 2>&1; then
+            echo "::error::rclone cannot reach seeed-storage:armbian/images — create the folder on OneDrive first, or refresh the RCLONE_CONFIG token."
+            exit 1
+          fi
+          echo "OneDrive remote OK. Quota:"
+          rclone about seeed-storage: 2>/dev/null | grep -E 'Total:|Free:|Trashed:' || true
+
+      - name: OneDrive mode notice (no secret)
+        # Fork path: assets go to the GitHub release instead.
+        if: ${{ env.HAS_RCLONE != 'true' }}
+        run: |
+          echo "::notice::RCLONE_CONFIG is not set — GitHub-assets mode (fork): binaries are attached to the release; OneDrive upload and image-promote are skipped."
+
+      - name: Validate secure-boot secrets
+        if: ${{ inputs.secure_boot }}
+        env:
+          PRIVATE_KEY_PEM: ${{ secrets.PRIVATE_KEY_PEM }}
+          DEV_CRT: ${{ secrets.DEV_CRT }}
+          CRYPTROOT_PASSPHRASE: ${{ secrets.CRYPTROOT_PASSPHRASE }}
+        run: |
+          set -euo pipefail
+          fail=0
+          err() { echo "::error::$1"; fail=1; }
+
+          [ -n "$PRIVATE_KEY_PEM" ] || err "secret PRIVATE_KEY_PEM is empty (secure_boot selected)"
+          [ -n "$DEV_CRT" ]        || err "secret DEV_CRT is empty (secure_boot selected)"
+          [ "${#CRYPTROOT_PASSPHRASE}" -eq 64 ] \
+            || err "CRYPTROOT_PASSPHRASE must be exactly 64 chars, got ${#CRYPTROOT_PASSPHRASE}"
+          if [ -n "$PRIVATE_KEY_PEM" ]; then
+            printf '%s\n' "$PRIVATE_KEY_PEM" | openssl rsa -check -noout >/dev/null 2>&1 \
+              || err "PRIVATE_KEY_PEM is not a parsable RSA key"
+          fi
+          if [ -n "$DEV_CRT" ]; then
+            printf '%s\n' "$DEV_CRT" | openssl x509 -noout >/dev/null 2>&1 \
+              || err "DEV_CRT is not a parsable x509 certificate"
+          fi
+          if [ -n "$PRIVATE_KEY_PEM" ] && [ -n "$DEV_CRT" ]; then
+            key_pub=$(printf '%s\n' "$PRIVATE_KEY_PEM" | openssl rsa -pubout 2>/dev/null | openssl md5)
+            crt_pub=$(printf '%s\n' "$DEV_CRT" | openssl x509 -pubkey -noout 2>/dev/null | openssl md5)
+            [ "$key_pub" = "$crt_pub" ] || err "PRIVATE_KEY_PEM does not match DEV_CRT"
+          fi
+
+          [ "$fail" -eq 0 ] || exit 1
+          echo "Secure-boot secrets present and well-formed."
+
+  plan:
+    needs: [probe-secrets, preflight]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      matrix: ${{ steps.gen.outputs.matrix }}
+      boards: ${{ steps.gen.outputs.boards }}
+      count: ${{ steps.gen.outputs.count }}
+      ab_repo: ${{ steps.gen.outputs.ab_repo }}
+      ab_commit: ${{ steps.source.outputs.ab_commit }}
+    steps:
+      - name: Generate matrix JSON from checkbox inputs
+        id: gen
+        run: |
+          set -euo pipefail
+
+          python3 <<'PY'
+          import json, os, itertools
+
+          def flag(name):
+              v = os.environ.get(name, "false").strip().lower()
+              return v in ("true", "1", "yes", "on")
+
+          # Board ids are the input names — the form is the single source of truth.
+          inputs = json.loads(os.environ["INPUTS_JSON"])
+          boards = sorted(
+              k for k, v in inputs.items()
+              if k.startswith("recomputer-") and str(v).lower() in ("true", "1", "yes", "on")
+          )
+
+          if not boards:
+              raise SystemExit("ERROR: select at least one board")
+
+          # Boards missing from the chosen armbian-build source are dropped
+          # (e.g. industrial until it merges). API hiccups keep the board —
+          # the build then fails loudly instead of being silently skipped.
+          import urllib.request, urllib.error
+          ab_repo = os.environ.get("AB_REPO", "").strip()
+          if not ab_repo:
+              ab_repo = "armbian-build:main"
+          # Auto-prepend repo owner if not specified (repo:branch → owner/repo:branch)
+          if "/" not in ab_repo.split(":")[0]:
+              owner = os.environ["GITHUB_REPOSITORY_OWNER"]
+              repo_part, _, branch_part = ab_repo.partition(":")
+              ab_repo = f"{owner}/{repo_part}:{branch_part}"
+          repo, _, branch = ab_repo.partition(":")
+          branch = branch or "main"
+
+          def board_exists(board):
+              headers = {"Accept": "application/vnd.github+json"}
+              tok = os.environ.get("GH_TOKEN", "").strip()
+              if tok:
+                  headers["Authorization"] = f"Bearer {tok}"
+              for ext in (".conf", ".csc"):
+                  url = f"https://api.github.com/repos/{repo}/contents/config/boards/{board}{ext}?ref={branch}"
+                  req = urllib.request.Request(url, headers=headers)
+                  try:
+                      with urllib.request.urlopen(req, timeout=15) as r:
+                          if r.status == 200:
+                              return True
+                  except urllib.error.HTTPError as e:
+                      if e.code == 404:
+                          continue
+                      raise
+              return False
+
+          present = []
+          for b in boards:
+              try:
+                  ok = board_exists(b)
+              except Exception as e:
+                  print(f"::warning::board check failed for {b} ({e}); keeping it")
+                  ok = True
+              if ok:
+                  present.append(b)
+              else:
+                  print(f"::notice::{b} is not in {repo}:{branch}; skipping it")
+          boards = present
+          if not boards:
+              raise SystemExit(f"ERROR: none of the selected boards exist in {repo}:{branch}")
+
+          # variants: (tier, release). Release is bound to the variant.
+          variants = [("cli", "trixie"), ("gnome", "resolute")]
+
+          otas = ["recovery"]
+          if flag("OTA_AB"): otas.append("ab")
+
+          securities = [""]
+          if flag("SECURE_BOOT"): securities.append("secure-boot")
+
+          entries = []
+          for b, (t, r), p, s in itertools.product(boards, variants, otas, securities):
+              entries.append({
+                  "board": b,
+                  "tier": t,
+                  "release": r,
+                  "profile": p,
+                  "security": s,
+              })
+
+          print(f"::group::Matrix entries ({len(entries)})")
+          for e in entries:
+              print(f"  board={e['board']:<28} release={e['release']:<10} tier={e['tier']:<8} profile={e['profile'] or '(none)'} security={e['security'] or '(none)'}")
+          print("::endgroup::")
+
+          boards_unique = list(dict.fromkeys(boards))
+
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write(f"matrix={json.dumps({'include': entries})}\n")
+              f.write(f"boards={json.dumps(boards_unique)}\n")
+              f.write(f"count={len(entries)}\n")
+              f.write(f"ab_repo={ab_repo}\n")
+          PY
+        env:
+          INPUTS_JSON: ${{ toJSON(inputs) }}
+          OTA_AB:       ${{ inputs.ota_ab }}
+          SECURE_BOOT:  ${{ inputs.secure_boot }}
+          AB_REPO:      ${{ inputs.armbian_build_repo }}
+          GH_TOKEN:     ${{ github.token }}
+
+      - name: Print summary
+        run: |
+          echo "Total matrix entries: ${{ steps.gen.outputs.count }}"
+          echo "Boards to build: ${{ steps.gen.outputs.boards }}"
+          echo "armbian-build: ${{ steps.gen.outputs.ab_repo }}"
+
+      - name: Resolve immutable build-source revision
+        id: source
+        env:
+          AB_REPO: ${{ steps.gen.outputs.ab_repo }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          ab_commit="$(gh api "repos/${AB_REPO%:*}/git/refs/heads/${AB_REPO##*:}" --jq .object.sha)"
+          [[ "$ab_commit" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::invalid armbian-build commit"; exit 1; }
+          echo "ab_commit=$ab_commit" >> "$GITHUB_OUTPUT"
+          echo "Pinned armbian-build source: ${AB_REPO%:*}@$ab_commit"
+  build:
+    needs: [preflight, plan]
+    runs-on: ubuntu-26.04
+    timeout-minutes: 360
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.plan.outputs.matrix).include }}
+    env:
+      EXTENSION_SHA: ${{ github.sha }}
+      BUILD_SOURCE_SHA: ${{ needs.plan.outputs.ab_commit }}
+      BOARD: ${{ matrix.board }}
+
+    steps:
+      # Extension rev is pinned inside armbian-build's seeed-extension.sh
+      # (SEEED_EXTENSION_REF), so no ref input here.
+      - name: Checkout extension (default branch)
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+
+      - name: Verify immutable extension source revision
+        run: |
+          test "$(git rev-parse HEAD)" = "$EXTENSION_SHA"
+          echo "Verified extension checkout: $EXTENSION_SHA"
+
+      - name: Free up disk space
+        run: |
+          echo "Disk space before cleanup:"
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                     /usr/local/share/boost /usr/local/share/openssl
+          sudo apt-get purge -y --auto-remove \
+                     'ghc-*' 'dotnet-*' 'llvm-*' 'azure-cli*' \
+                     'firefox*' 'google-chrome*' 'powershell*' 'snapd' || true
+          sudo apt-get autoremove -y --purge
+          sudo apt-get clean
+          docker system prune -af --volumes || true
+          echo "Disk space after cleanup:"
+          df -h /
+
+      - name: Install qemu-user-binfmt for cross-arch rootfs chroot
+        # qemu-user-binfmt registers qemu-aarch64 etc on the host with the
+        # fix-binary flag so containers can chroot into arm64 rootfs.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qemu-user-binfmt binfmt-support
+          echo "=== binfmt_misc registrations (host) ==="
+          ls /proc/sys/fs/binfmt_misc/ || true
+          echo "=== qemu-aarch64 entry ==="
+          cat /proc/sys/fs/binfmt_misc/qemu-aarch64 2>/dev/null || echo "qemu-aarch64 not registered"
+
+      - name: Resolve armbian-build repo
+        # input is repo:branch or owner/repo:branch — validate and split.
+        # Auto-prepends repo owner if missing (plan-resolved).
+        id: abrepo
+        env:
+          AB_REPO: ${{ needs.plan.outputs.ab_repo }}
+          AB_COMMIT: ${{ needs.plan.outputs.ab_commit }}
+        run: |
+          set -euo pipefail
+          [[ "${AB_REPO}" =~ ^[A-Za-z0-9_.-]+(/[A-Za-z0-9_.-]+)?:[A-Za-z0-9._/-]+$ ]] \
+            || { echo "::error::armbian_build_repo must be 'owner/repo:branch', got '${AB_REPO}'"; exit 1; }
+          echo "repo=${AB_REPO%:*}" >> "$GITHUB_OUTPUT"
+          echo "ref=${AB_COMMIT}" >> "$GITHUB_OUTPUT"
+          echo "armbian-build: ${AB_REPO%:*} @ ${AB_COMMIT}"
+
+      - name: Checkout armbian-build
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ steps.abrepo.outputs.repo }}
+          ref: ${{ steps.abrepo.outputs.ref }}
+          path: armbian-build
+          fetch-depth: 1
+
+      - name: Verify immutable build-source revision
+        working-directory: armbian-build
+        env:
+          SOURCE_SHA: ${{ needs.plan.outputs.ab_commit }}
+        run: |
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          echo "Verified armbian-build checkout: $SOURCE_SHA"
+
+      - name: Add trailing blank line to vendor defconfigs
+        run: |
+          cd armbian-build
+          # covers non-devkit boards (recomputer-rk3576-industrial) too
+          for f in patch/u-boot/legacy/u-boot-radxa-rk35xx/defconfig/recomputer-rk35*_defconfig; do
+            [[ -f "$f" ]] || continue
+            echo "" >> "$f"
+            echo "Added trailing blank line to $f"
+          done
+
+      - name: Patch armbian docker.sh to forward CRYPTROOT_PASSPHRASE
+        run: |
+          cd armbian-build
+          sed -i '/"--env" "ARMBIAN_RUNNING_IN_CONTAINER=yes"/a\\t\t"--env" "CRYPTROOT_PASSPHRASE=${CRYPTROOT_PASSPHRASE:-}"' \
+              lib/functions/host/docker.sh
+          # Same container boundary: SEEED_EXTENSION_REPO/REF exported on the
+          # host never reach the wrapper sourcing inside the container, so the
+          # extension fetch silently falls back to upstream main.
+          sed -i '/"--env" "CRYPTROOT_PASSPHRASE=/a\\t\t"--env" "SEEED_EXTENSION_REPO=${SEEED_EXTENSION_REPO:-}"\n\t\t"--env" "SEEED_EXTENSION_REF=${SEEED_EXTENSION_REF:-}"' \
+              lib/functions/host/docker.sh
+          echo "=== env forwarding in docker.sh ==="
+          grep -nE 'CRYPTROOT_PASSPHRASE|SEEED_EXTENSION_(REPO|REF)' lib/functions/host/docker.sh
+
+      - name: Patch radxa-aic8800 extension against GitHub API flakiness
+        # api.github.com flakes on CI; upstream resolves the version to
+        # "null" and wget 404s. Patch adds version pin + cache fallback.
+        run: |
+          cd armbian-build
+          git apply "${GITHUB_WORKSPACE}/.github/patchs/radxa-aic8800.sh.patch"
+          echo "=== patched radxa-aic8800.sh ==="
+          grep -n "AIC8800_FALLBACK_VERSION\|aic8800_download_file_with_cache" extensions/radxa-aic8800.sh | head -5
+
+      - name: Pre-create rkbin symlink for A/B OTA
+        if: ${{ matrix.profile == 'ab' }}
+        run: |
+          cd armbian-build
+          mkdir -p cache/sources/u-boot-worktree/u-boot-rockchip64
+          ln -sfn ../../rkbin-tools cache/sources/u-boot-worktree/u-boot-rockchip64/rkbin
+          echo "=== rkbin symlink ==="
+          ls -la cache/sources/u-boot-worktree/u-boot-rockchip64/
+
+      - name: Place FIT signing keys for secure profiles
+        if: ${{ matrix.security == 'secure-boot' }}
+        run: |
+          set -euo pipefail
+          cd armbian-build
+          mkdir -p cache/sources/fit-keys
+          printf '%s\n' "${PRIVATE_KEY_PEM}" > cache/sources/fit-keys/private_key.pem
+          printf '%s\n' "${DEV_CRT}" > cache/sources/fit-keys/dev.crt
+          chmod 0600 cache/sources/fit-keys/private_key.pem
+          chmod 0644 cache/sources/fit-keys/dev.crt
+          echo "=== FIT keys placed at cache/sources/fit-keys ==="
+          ls -la cache/sources/fit-keys/
+          echo "=== Key sanity check ==="
+          openssl rsa -in cache/sources/fit-keys/private_key.pem -check -noout 2>&1 || true
+          openssl x509 -in cache/sources/fit-keys/dev.crt -noout -subject 2>&1 || true
+        env:
+          PRIVATE_KEY_PEM: ${{ secrets.PRIVATE_KEY_PEM }}
+          DEV_CRT: ${{ secrets.DEV_CRT }}
+
+      - name: Symlink build.sh into armbian-build root
+        run: |
+          ln -sf "$GITHUB_WORKSPACE/scripts/build.sh" armbian-build/seeed-build.sh
+          ls -la armbian-build/seeed-build.sh
+
+      - name: Pull docker image
+        run: docker pull ${{ env.DOCKER_IMAGE }}
+
+      - name: Restore armbian deb packages cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            armbian-build/output/debs
+            armbian-build/output/packages-hashed
+          key: debs-arm64-${{ matrix.board }}-vendor-${{ hashFiles('armbian-build/config/sources/families/seeed-rk*.conf', 'armbian-build/config/sources/families/rk35xx.conf', 'armbian-build/config/sources/vendors/seeed-studio/*.inc') }}
+          restore-keys: |
+            debs-arm64-${{ matrix.board }}-vendor-
+
+      - name: Restore ccache
+        uses: actions/cache@v4
+        with:
+          path: armbian-build/cache/ccache
+          key: ccache-arm64-${{ matrix.board }}-vendor-${{ github.sha }}
+          restore-keys: |
+            ccache-arm64-${{ matrix.board }}-vendor-
+            ccache-arm64-${{ matrix.board }}-
+
+      # rootfs cache disabled: each entry ~2 GiB × N variants would blow the
+      # 10 GiB repo cache and evict the kernel debs cache (30+ min rebuild).
+      # Rootfs from scratch is only ~10 min.
+
+      # The armbian-build wrapper extensions/seeed-extension.sh hardcodes the
+      # UPSTREAM extension repo (Seeed-Studio/seeed_armbian_extension @ main),
+      # so every build would compile the upstream code and never the fixes on
+      # the dispatched ref of THIS repo. Make the repo overridable (the ref
+      # already is via SEEED_EXTENSION_REF) and point both at this checkout.
+      - name: Point seeed-extension at this checkout
+        run: |
+          cd armbian-build
+          sed -i \
+            -e 's|^SEEED_EXTENSION_REPO=.*|SEEED_EXTENSION_REPO="${SEEED_EXTENSION_REPO:-https://github.com/Seeed-Studio/seeed_armbian_extension}"|' \
+            extensions/seeed-extension.sh
+          echo "=== seeed-extension repo/ref now overridable ==="
+          grep -n 'SEEED_EXTENSION_REPO=\|SEEED_EXTENSION_REF=' extensions/seeed-extension.sh | head -4
+
+      - name: Build
+        working-directory: armbian-build
+        env:
+          PROFILE: ${{ matrix.profile }}
+          SECURITY: ${{ matrix.security }}
+          TIER: ${{ matrix.tier }}
+          BOARD: ${{ matrix.board }}
+          RELEASE: ${{ matrix.release }}
+          DESKTOP_TIER: ${{ inputs.desktop_tier }}
+        run: |
+          set -euo pipefail
+          # Build the extension code from this workflow's repo + ref, not the
+          # upstream main the armbian-build wrapper pins by default.
+          export SEEED_EXTENSION_REPO="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}.git"
+          export SEEED_EXTENSION_REF="commit:${GITHUB_SHA}"
+          echo "extension source: ${SEEED_EXTENSION_REPO} @ ${SEEED_EXTENSION_REF}"
+          # cli → --minimal (Debian 13); gnome → desktop (Ubuntu 26.04)
+          # sized by the desktop_tier choice.
+          TIER_ARGS=""
+          if [[ "$TIER" == "cli" ]]; then
+              TIER_ARGS="--minimal"
+          else
+              TIER_ARGS="-d gnome -t $DESKTOP_TIER"
+          fi
+
+          # Passphrase only when a security profile is set (preflight-validated).
+          if [[ -n "$SECURITY" ]]; then
+              export CRYPTROOT_PASSPHRASE="${{ secrets.CRYPTROOT_PASSPHRASE }}"
+          fi
+
+          if [[ -d cache/sources/fit-keys ]]; then
+              export UBOOT_FIT_KEYS_BACKUP_DIR="/armbian/cache/sources/fit-keys"
+          fi
+
+          # shellcheck disable=SC2086
+          ./seeed-build.sh \
+            $PROFILE \
+            $SECURITY \
+            -b "$BOARD" \
+            -R "$RELEASE" \
+            $TIER_ARGS
+
+      - name: Compress .img to .img.xz + sha256
+        working-directory: armbian-build
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          for img in output/images/*.img; do
+            base="$(basename "$img" .img).img.xz"
+            echo "Compressing $img -> output/images/$base"
+            xz -T0 -6 -v < "$img" > "output/images/$base"
+            ( cd output/images && sha256sum "$base" > "$base.sha256" )
+            echo "Removing uncompressed $img"
+            rm -f "$img"
+          done
+          echo "=== output/images/ contents ==="
+          ls -lh output/images/
+
+      - name: Upload output/images/ as-is
+        uses: actions/upload-artifact@v4
+        with:
+          name: Armbian-img-${{ matrix.board }}-${{ matrix.release }}-${{ matrix.tier }}-${{ matrix.profile || 'recovery' }}-${{ matrix.security || 'plain' }}-${{ github.run_id }}
+          path: armbian-build/output/images/
+          if-no-files-found: warn
+          retention-days: 14
+          compression-level: 0
+
+      - name: Print ccache stats
+        run: |
+          command -v ccache >/dev/null 2>&1 || { echo "ccache not installed on host; install with: sudo apt-get install -y ccache"; exit 0; }
+          ccache -s 2>/dev/null || true
+          du -sh armbian-build/cache/ccache 2>/dev/null || true
