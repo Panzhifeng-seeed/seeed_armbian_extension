@@ -1,5 +1,6 @@
 # Stage the Seeed rescue-default-env U-Boot patch (recovery OTA v0.8 design
-# section 3.4) into the userpatches overlay for EVERY build flavor.
+# section 3.4) into the userpatches overlay for every distro-form U-Boot tree
+# (the vendor-next v5 bootstd tree is skipped -- gate in the function below).
 #
 # The patch's default bootcmd is self-routing: ota_rescue_boot boots the
 # /recovery/ assets only when they exist and falls through to
@@ -30,6 +31,22 @@ function post_family_config__seeed_ota_stage_uboot_rescue_default_env() {
 	boot_patch_dir="${BOOTPATCHDIR%% *}"
 	target_dir="${USERPATCHES_PATH}/u-boot/${boot_patch_dir}"
 	target_patch="${target_dir}/seeed-ota-rescue-default-env.patch"
+
+	# The patch anchors on the distro-form SoC headers -- the
+	# config_distro_bootcmd.h include and the BOOTENV tail of
+	# EXTRA_ENV_SETTINGS -- which only the 2017.09/radxa tree carries. The
+	# vendor-next v5 tree (legacy/u-boot-rockchip-v5) went bootstd: that
+	# include has no rockchip includer there and the default bootcmd is the
+	# vendor boot_fit/bootflow chain, so the patch can neither apply (every
+	# vendor-next build failed at the patching step) nor make sense -- its
+	# fail-safe bootcmd falls through to distro_bootcmd, which does not
+	# exist in that form. Skip (and heal a copy staged by pre-gating builds)
+	# until a bootstd-shaped rescue default is designed.
+	if [[ "${boot_patch_dir}" == "legacy/u-boot-rockchip-v5" ]]; then
+		rm -f "${target_patch}"
+		display_alert "seeed-ota" "rescue-default-env: u-boot-rockchip-v5 is bootstd-form, patch not staged" "info"
+		return 0
+	fi
 
 	mkdir -p "${target_dir}"
 	cp -f "${patch_src}" "${target_patch}"
