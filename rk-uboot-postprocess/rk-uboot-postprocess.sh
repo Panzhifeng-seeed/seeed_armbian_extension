@@ -49,14 +49,25 @@ _seeed_compile_usbplug() {
 	local usbplug_dir
 	display_alert "Compiling usbplug from source" "${soc} Maskrom recovery" "info"
 
-	# Configure for usbplug (ARCH=arm covers both arm32/arm64 SoCs)
-	run_host_command_logged CCACHE_BASEDIR="$(pwd)" \
-		pipetty make "rockchip-usbplug_defconfig" "${cross_compile}" "ARCH=arm"
-	run_host_command_logged scripts/kconfig/merge_config.sh -m .config "configs/${soc}-usbplug.config"
+	# Configure for usbplug (ARCH=arm covers both arm32/arm64 SoCs).
+	# Tree fork: the v5 u-boot tree (rockchip-linux/u-boot v5) ships a
+	# single-stage <board>-usbplug defconfig with CONFIG_SUPPORT_USBPLUG=y;
+	# the 2017.09 tree uses the two-stage rockchip-usbplug_defconfig +
+	# configs/<soc>-usbplug.config overlay. Pick by what the tree provides.
+	if [[ -f "configs/recomputer-${soc}-devkit-usbplug_defconfig" ]]; then
+		# v5 single-stage (SPI NOR recovery configs already folded in)
+		run_host_command_logged CCACHE_BASEDIR="$(pwd)" \
+			pipetty make "recomputer-${soc}-devkit-usbplug_defconfig" "${cross_compile}" "ARCH=arm"
+	else
+		run_host_command_logged CCACHE_BASEDIR="$(pwd)" \
+			pipetty make "rockchip-usbplug_defconfig" "${cross_compile}" "ARCH=arm"
+		run_host_command_logged scripts/kconfig/merge_config.sh -m .config "configs/${soc}-usbplug.config"
+	fi
 
 	# RK3588 usbplug config disables SPI flash support, but Maskrom SPI NOR recovery
-	# needs it. RK3576 config already has it enabled.
-	if [[ "$soc" == "rk3588" ]]; then
+	# needs it. RK3576 config already has it enabled. (2017.09 two-stage only; the
+	# v5 single-stage defconfig already carries the SFC/SPI-NOR settings.)
+	if [[ "$soc" == "rk3588" && ! -f "configs/recomputer-${soc}-devkit-usbplug_defconfig" ]]; then
 		sed -i 's/# CONFIG_ROCKCHIP_SFC is not set/CONFIG_ROCKCHIP_SFC=y/' .config
 		sed -i 's/# CONFIG_MTD is not set/CONFIG_MTD=y/' .config
 		sed -i 's/# CONFIG_MTD_BLK is not set/CONFIG_MTD_BLK=y/' .config
@@ -113,6 +124,35 @@ _seeed_rk3576_spl_loader() {
 
 	display_alert "boot_merger for 'rk3576' for scenario ${BOOT_SCENARIO}" \
 		"SPL_BIN_PATH: ${spl_bin_path}" "debug"
+
+	# vendor-next (rockchip-linux/u-boot v5): the official rkbin master uses the
+	# RKBOOT/RK3576MINIALL_V5.ini layout with bin/rk35/ blob paths, and one
+	# boot_merger run yields both the idbloader (IDB_PATH=, for the parted-GPT
+	# rkspi_loader.img) and the Maskrom loader (PATH=, spl_loader_maskrom.bin).
+	# The 2017.09 rk35/RK3576MINIALL.ini flow below stays for BRANCH=vendor.
+	if [[ "${BRANCH:-}" == "vendor-next" ]]; then
+		local usbplug_v5="${RKBIN_DIR}/bin/rk35/rk3576_usbplug_v1.04.bin"
+		if [[ "${RK_COMPILE_USBPLUG:-no}" == "yes" ]]; then
+			[[ -f "${USBPLUG_BUILT_PATH:-}" ]] ||
+				exit_with_error "Prebuilt RK3576 USBPlug artifact is missing" "${USBPLUG_BUILT_PATH:-<unset>}"
+			usbplug_v5="${USBPLUG_BUILT_PATH}"
+		fi
+		local rkboot_ini_v5=rk3576-v5.ini
+		cp $RKBIN_DIR/RKBOOT/RK3576MINIALL_V5.ini $rkboot_ini_v5
+		sed -i -e "s|FlashBoost=.*$|FlashBoost=${RKBIN_DIR}/bin/rk35/rk3576_boost_v1.03.bin|" \
+		       -e "s|FlashData=.*$|FlashData=${spl_bin_path}|" \
+		       -e "s|FlashBoot=.*$|FlashBoot=${flash_boot_bin}|" \
+		       -e "s|Path1=.*rk3576_ddr.*$|Path1=${spl_bin_path}|" \
+		       -e "s|Path1=.*rk3576_usbplug.*$|Path1=${usbplug_v5}|" \
+		       -e "s|^PATH=.*$|PATH=spl_loader_maskrom.bin|" \
+		       -e "s|^IDB_PATH=.*$|IDB_PATH=idbloader.img|" $rkboot_ini_v5
+		run_host_x86_binary_logged $RKBIN_DIR/tools/boot_merger $rkboot_ini_v5
+		rm -f $rkboot_ini_v5
+		display_alert "maskrom spl_loader (v5) ready for deb packaging" \
+			"$(du -h spl_loader_maskrom.bin | cut -f1)" "info"
+		return 0
+	fi
+
 	local rkboot_ini=rk3576.ini
 	cp $RKBIN_DIR/rk35/RK3576MINIALL.ini $rkboot_ini
 	sed -i "s|FlashBoost=.*$|FlashBoost=${RKBIN_DIR}/rk35/rk3576_boost_v1.02.bin|g" $rkboot_ini
@@ -196,7 +236,12 @@ RK3588EOF
 	# Default: rkbin-tools usbplug blob. An optional source-built artifact is
 	# prepared before the main U-Boot configuration, so this postprocess step
 	# never changes the final U-Boot build tree.
+	# Layout fork: vendor-next points RKBIN_DIR at the official
+	# rockchip-linux/rkbin checkout, which prefixes blobs with bin/
+	# (bin/rk35/...); BRANCH=vendor uses the armbian/rkbin mirror, which does
+	# not (rk35/...).
 	local usbplug_path="${RKBIN_DIR}/rk35/rk3588_usbplug_v1.11.bin"
+	[[ "${BRANCH:-}" == "vendor-next" ]] && usbplug_path="${RKBIN_DIR}/bin/rk35/rk3588_usbplug_v1.11.bin"
 	if [[ "${RK_COMPILE_USBPLUG:-no}" == "yes" ]]; then
 		[[ -f "${USBPLUG_BUILT_PATH:-}" ]] ||
 			exit_with_error "Prebuilt RK3588 USBPlug artifact is missing" "${USBPLUG_BUILT_PATH:-<unset>}"
