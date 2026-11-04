@@ -52,9 +52,14 @@ function ota_ab_extract_uboot_default_env() {
         tr '\0' '\n' |
         awk 'NF { print; next } { exit }' > "${output_env}"
 
-    grep -q '^distro_bootcmd=' "${output_env}" &&
-        grep -q '^scan_dev_for_boot=' "${output_env}" &&
-        grep -q '^bootcmd=' "${output_env}"
+    # Default-env sanity, boot-shape agnostic: the distro machinery
+    # (distro_bootcmd/scan_dev_for_boot) only exists with CONFIG_DISTRO_DEFAULTS;
+    # the rockchip-official bootstd shape (v5 vendor chain) carries
+    # bootcmd="...bootflow scan -bl;" and the vendor boot_targets string instead.
+    grep -q '^bootcmd=' "${output_env}" &&
+        grep -q '^boot_targets=' "${output_env}" && {
+        grep -q '^distro_bootcmd=' "${output_env}" || grep -q 'bootflow' "${output_env}"
+    }
 }
 
 function ota_ab_default_env_file_for_rootfs() {
