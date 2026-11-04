@@ -45,6 +45,14 @@ recovery_boot_disk() {
         esac
     done
 
+    # U-Boot bootstd script bootmeth exports devnum via env_set_hex
+    # ("0x1"); the distro-boot setenv path used decimal ("1"). The boot
+    # script passes the value through verbatim into the bootargs token,
+    # so accept both spellings.
+    case "${devnum:-}" in
+        0x*) devnum="${devnum#0x}" ;;
+    esac
+
     case "${devtype:-}" in
         mmc)
             [ -b "/dev/mmcblk${devnum:-}" ] || return 1
