@@ -39,6 +39,12 @@ for x in $(cat /proc/cmdline 2>/dev/null); do
     esac
 done
 
+# The bootstd script bootmeth exports devnum via env_set_hex ("0x0"); the
+# distro-boot setenv path used decimal ("0"). Accept both spellings.
+case "${bootdev_num:-}" in
+    0x*) bootdev_num="${bootdev_num#0x}" ;;
+esac
+
 [ -n "${bootdev_type}" ] || exit 0
 
 case "${bootdev_type}" in
@@ -52,28 +58,27 @@ case ${ROOT:-} in
     *) exit 0 ;;
 esac
 
-[ -b "${bootdev_disk}" ] || {
-    log_step "token disk ${bootdev_disk} not present, leaving root unchanged"
-    exit 0
-}
-
 blkid_match="${ROOT}"
 
 # Device enumeration can still be in flight this early; retry briefly, and
 # never hard-fail: an unresolved anchor must degrade to the stock behavior.
+# The token disk itself may not exist yet at init-top (NVMe trails eMMC in
+# kernel probe order), so its presence is polled inside the loop too.
 attempt=0
 anchored=""
 while [ "${attempt}" -lt 10 ]; do
-    for dev in $(blkid -t "${blkid_match}" -o device 2>/dev/null); do
-        base="${dev#/dev/}"
-        [ -L "/sys/class/block/${base}" ] || continue
-        parent="$(basename "$(dirname "$(readlink -f "/sys/class/block/${base}")")")"
-        if [ "/dev/${parent}" = "${bootdev_disk}" ]; then
-            anchored="${dev}"
-            break
-        fi
-    done
-    [ -n "${anchored}" ] && break
+    if [ -b "${bootdev_disk}" ]; then
+        for dev in $(blkid -t "${blkid_match}" -o device 2>/dev/null); do
+            base="${dev#/dev/}"
+            [ -L "/sys/class/block/${base}" ] || continue
+            parent="$(basename "$(dirname "$(readlink -f "/sys/class/block/${base}")")")"
+            if [ "/dev/${parent}" = "${bootdev_disk}" ]; then
+                anchored="${dev}"
+                break
+            fi
+        done
+        [ -n "${anchored}" ] && break
+    fi
     attempt=$((attempt + 1))
     sleep 1
 done
