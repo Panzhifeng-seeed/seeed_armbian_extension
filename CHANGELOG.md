@@ -12,8 +12,50 @@ Covers the work against the initial import (merge base `9980aee`,
 
 ### Added
 
+#### Production loaders (maskrom / SPI flash)
+
+- **Board u-boot production artifacts exported with each image.** Every build now ships
+  `spl_loader_maskrom.bin` (maskrom flashing loader) in the u-boot deb for
+  **every board** — the RK3576/RK3588 spl-blobs hooks append it to
+  `target_files` gate-free, fixing industrial / module-devkit builds that
+  generated the loader and silently dropped it (their only packaging path
+  was the `BOOT_SUPPORT_SPI`-gated `board_uboot_spi_image_after_build`
+  hook, now an idempotent backstop). Boards whose layout builds one also
+  ship `rkspi_loader.img` (SPI NOR image; devkit boards today — boards
+  without `BOOT_SUPPORT_SPI` never generate it, by design). A new
+  `pre_umount_final_image__902_export_production_loaders` hook exports
+  both from the installed u-boot deb into
+  `output/images/<board>/loaders/<plain|secure>/` (xz + `.sha256`); plain
+  and secure never share a directory (secure legs rebuild both files
+  signed). The compressed loaders and SHA-256 checksums are available to
+  the publishing workflow under `output/images/<board>/loaders/`.
+
 #### Recovery OTA
 
+- **Secure-boot rescue: dedicated `recovery` raw FIT partition.** Secure
+  boot Recovery images now split the boot area in two: the existing raw FIT
+  `boot` partition plus a new `PARTLABEL=recovery` partition (same size as
+  boot) holding the **same signed boot.itb**, flashed at image build time
+  (`rescue-artifacts.sh`) and booted by the new `ota_rescue_boot_fit` env
+  script (vendor `boot_fit` command, `boot_fit_part recovery` — mirroring
+  the A/B raw-fit slot boot, so FIT signature verification applies). The
+  rescue dispatcher `ota_rescue_boot` now chains
+  `ota_rescue_boot_fs || ota_rescue_boot_fit || distro_bootcmd` across the
+  three env producers (build-time prefill, `fw_env_write_routing_set`, and
+  the compiled-default-env U-Boot patch). The rescue partition is never
+  touched by OTA. Layout:
+  `[boot raw FIT][recovery raw FIT][security][rootfs LUKS+ext4][userdata LUKS+ext4]`.
+- **Secure-boot OTA packages.** `package-create.sh` computes a `PAYLOAD_ID`
+  for secure-boot recovery packages (identity over the rootfs tar + the
+  boot.itb tree) and stamps the rootfs `installed-payload-id` marker —
+  previously the secure branch shipped no `PAYLOAD_ID` and the build failed
+  at `ota_write_package_env`. Device-side `recovery_assert_dual_tar` accepts
+  the `boot.itb + boot.sha256` payload shape; the lazy last-good backup
+  reads the signed FIT from the raw boot partition (exact FDT-header size)
+  into `boot.tar.zst`, restoring through the existing
+  `write_raw_boot_itb` path. The health service and the Rescue
+  success-reconciliation skip the `/boot/payload-id` check on raw-fit
+  layouts (stamped `/usr/share/armbian-ota/boot-mode`).
 - **Dedicated `/boot` partition for all Recovery images.** Plain and
   auto-decrypt Recovery builds now reserve a separate ext4 boot partition
   (label `armbi_boot`); the initramfs mounts it on top of overlayfs,
@@ -23,7 +65,7 @@ Covers the work against the initial import (merge base `9980aee`,
   edits, OTA tooling) being swallowed by the overlayfs upper layer on
   userdata and silently ignored by U-Boot on next boot. Secure-boot
   Recovery continues to use a raw FIT boot partition (`BOOT_RAW_MODE=yes`),
-  unchanged. The partition order is now `[boot][security?][rootfs][userdata]`.
+  unchanged. The partition order is now `[boot][recovery?][security?][rootfs][userdata]`.
 - **`recurse=0` on overlayroot.** The overlayroot package's init-bottom
   hook defaults to `recurse=1`, which wraps every fstab mount point in a
   per-directory overlay — so even with a dedicated boot partition, `/boot`
@@ -103,7 +145,7 @@ Covers the work against the initial import (merge base `9980aee`,
   key — no Armbian rebuild needed. Includes a sample-FIT builder mode for
   testing the re-sign path and refuses to re-sign the build-time staging
   artifact in place.
-- **`seeed-build` CI workflow.** A matrix image builder on GitHub Actions:
+- **Image-builder CI workflow (`build-images.yml`, was `seeed-build`).** A matrix image builder on GitHub Actions:
   preflight validates secrets before the multi-hour build (FIT key pair,
   64-char passphrase, live rclone probe), the matrix is planned from dispatch
   checkboxes (board × release × tier × OTA × security; plain and secure-boot
@@ -158,8 +200,117 @@ Covers the work against the initial import (merge base `9980aee`,
 - **Mirror/cache passthrough** through the build wrapper.
 - **PCIe ASPM disabled** in generated images via `extraargs=pcie_aspm=off`.
 
+#### CI
+
+- **OneDrive mirror: slot-first layout + per-slot tag files; no more
+  build-info.json.** The images tree is re-rooted from
+  `images/<board>/<slot>/…` to
+  `images/<slot>/<board>/<profile>[-secure-boot]/…` (slot ∈ pre-release /
+  latest / previous): rotation unit now equals release unit, promotion is
+  one server-side move per slot (every board flips together, no per-board
+  parallel rclone), and the staging purge at build start is a single
+  call. Each slot carries a `tag` file (the YYMMDD-HHMM build stamp)
+  written once every matrix entry has uploaded — it is the page's slot
+  binding (slot labels no longer inferred from release-list ordering) and
+  promote verifies it names the release being promoted before rotating.
+  The release carries no assets: the old `build-info.json` manifest is
+  gone (its identity role moved to `<slot>/tag`; releases without assets
+  are what promote's cleanup treats as superseded). The page walk lists
+  the whole `images/` tree in one `lsjson -R` (boards are discovered, no
+  board list input) and reads the three `tag` files; the release-list
+  inference stays as the fork-mode fallback (`SLOTS={}`).
+- **`apt-repo-publish.yml`: rk3576-module board, family-scoped kernel.**
+  New `build_rk3576_module` dispatch input extends the per-board matrix.
+  Kernel debs are family-scoped in Armbian (`linux-image`/`-headers`/
+  `-dtb` are per LINUXFAMILY and the DTB deb carries every family DTB),
+  so the first selected board of each family compiles the kernel once
+  and sibling boards build only their board-specific U-Boot — no
+  duplicate same-named kernel debs in the publish merge, no extra
+  kernel CI time per added board.
+- **`apt-repo-publish.yml`: rk3576-industrial board.** New
+  `build_rk3576_industrial` dispatch input (default on). Each matrix job
+  checks the board config exists in the selected `armbian_build_ref` and
+  skips gracefully with a notice when it does not — the board is not in
+  `Seeed-Studio/armbian-build` main yet, so default runs skip it until
+  the branch lands (meanwhile dispatch with
+  `armbian_build_ref=rk3576-industrial`).
+- **`apt-repo-publish.yml`: kernel compilation now opt-in.** New
+  `build_kernel` dispatch input (default false): the official Armbian
+  apt already hosts the `vendor-seeed-rk3576`/`rk3588` family kernels,
+  so the matrix builds U-Boot only by default; enable the input to
+  rebuild and publish family kernels (hotfix channel — the version
+  must outrank the official one to reach devices).
+- **`apt-repo-publish.yml`: kernel and U-Boot build in parallel.** The
+  board matrix carries a `target` dimension (`uboot` per selected board,
+  `kernel` per family when `build_kernel` is on), so each entry is an
+  independent job — a board's U-Boot no longer serializes behind its
+  kernel compile. Artifact names carry the target
+  (`debs-uboot-<board>`, `debs-kernel-<board>`).
+
 ### Changed
 
+- **OTA gate order normalized: cheapest-first, pure checks before side
+  effects.** Three reorders, no logic changes: A/B's `ota_in_progress`
+  guard now runs first in the backend (one `fw_printenv` read beats the
+  PARTLABEL/blockdev probes it used to trail); `ota_assert_dual_payload`
+  moved before `ab_open_userdata` so a malformed package never triggers
+  the userdata mount/LUKS-open side effect; Recovery runs space + capacity
+  before the dual-payload assertion — `tar -tf` must stream-decompress the
+  whole multi-GB package to list members, making it the most expensive
+  pre-staging check, while a staging-space shortfall is the more common
+  field failure and now fails fast.
+- **Rootfs partition headroom raised 20% → 50%.** `OTA_ROOTFS_SIZE` now
+  defaults to `(rootfs + EXTRA_ROOTFS_MIB_SIZE) × 1.5` (reversing the earlier
+  leaner-sizing cut of 2026-10). Combined with the device capacity gate's
+  110% extract margin, devices flashed with these images accept OTA payloads
+  up to ~36% larger than their flashed rootfs (previously ~9%). Cost: the
+  delta is taken from the userdata partition (doubled on A/B, which sizes
+  two slots); existing devices keep their flashed partition sizes and gain
+  nothing — the gate still protects them.
+- **A/B staging moved off the live rootfs, with a space gate.** `ab_start_ota`
+  now opens and mounts the reserved `userdata` partition for the duration of
+  the transaction (LUKS-unlocked with the same security-flow passphrase as the
+  root slots on encrypted layouts, swept of aborted runs' staging dirs,
+  idempotently torn down afterwards) and stages the package plus its extracted
+  members there. Previously staging went to `/ota_work` on the ACTIVE slot's
+  root filesystem -- a GB-scale write that could fill and wedge the running
+  system. A new `ab_check_space` (twin of recovery's space gate: package × 2
+  + shared 512 MiB margin) bounds whichever filesystem ends up hosting the
+  fallback; a failed `stat` no longer silently collapses `need` to 0 in
+  either mode's space gate. Any userdata open failure only downgrades staging
+  back to `/ota_work` with a warning.
+- **Partition capacity gate on both OTA modes.** `package-create.sh` now
+  stamps `ROOTFS_BYTES`/`BOOT_BYTES` into `package.env` (`du --apparent-size`
+  of the exact trees that get extracted, mirroring the payload tar's excludes
+  -- the same measurement basis as the build framework's `rootfs_size`) plus a
+  `BOOT_KIND=itb|tar` shape stamp. Both backends compare them against the
+  target partition (`blockdev --getsize64`) with a 110% ext4-metadata margin
+  **before** any write: recovery before its mkfs destroys the old rootfs
+  (probing the running root source, i.e. the LUKS mapper on encrypted
+  builds), A/B against the inactive slot partitions by PARTLABEL (encrypted
+  targets additionally reserve the LUKS2 header area). A `BOOT_KIND=itb`
+  payload is dd'd verbatim and is compared 1:1 instead of with the extract
+  margin. Previously an oversized payload failed mid-extract, after
+  recovery's mkfs had already wiped the rootfs. Packages built before the
+  stamps exist skip the gate with a warning so the published fleet stays
+  updatable.
+- **Dual-payload assertion shared by both OTA modes.** The KIND=full
+  assertion (both the rootfs archive and a boot member must exist AND be
+  covered by their checksum files -- a broken build that drops e.g. boot.tar
+  together with boot.sha256 would otherwise still verify green and apply
+  "new rootfs + old boot") moved from `recovery_assert_dual_tar` to
+  `ota_assert_dual_payload` in `common.sh`; `ab_start_ota` now runs it too
+  (A/B previously had no equivalent check).
+- **BOARD/RELEASE gate now covers both OTA modes, with an explicit
+  cross-release escape hatch.** The board/release matching that Recovery
+  enforced inside `recovery_check_package_metadata` moved into the shared
+  `ota_check_board_release` pre-flight (`armbian-ota start`'s `check_ota_pkg`
+  step), so A/B packages are now checked too (previously A/B accepted any
+  board/release silently). Packages missing `BOARD`/`RELEASE` in `package.env`
+  are refused outright instead of silently passing. Cross-release updates
+  (e.g. trixie <-> resolute) remain blocked by default but can be accepted
+  explicitly with the new `armbian-ota start --allow-release-change` (both
+  modes; BOARD mismatch is never overridable).
 - **Stock image naming; OTA packages under `ota/`.** Recovery images no
   longer carry a `_RECOVERY` suffix (stock names, no router changes); A/B
   keeps its `_AB_PART` marker. OTA packages are layout-agnostic
@@ -240,6 +391,17 @@ Covers the work against the initial import (merge base `9980aee`,
   `rk-cryptroot-verbosity.sh`, board defconfigs that lived in-repo).
 
 ### Fixed
+
+- **A/B payload extraction died on compressed tarballs (`tar: Archive is
+  compressed. Use -J option`).** `ab_extract_tar_payload` piped the raw
+  payload through `pv` straight into `tar -xf -`; GNU tar only auto-detects
+  compression on seekable archive files, so reading compressed bytes from a
+  pipe aborts (observed on rk3576, tar 1.35, encrypted `rootfs.tar.xz` —
+  decrypt and verify had already succeeded). The no-`pv` fallback was
+  equally broken, hardcoding `-xzf` (gzip-only). Both paths now run an
+  explicit `<decompressor> | tar -xf -` pipeline with the codec picked by
+  payload suffix (xz/zst/gz, mirroring the recovery initramfs `payload.sh`),
+  with `xz -T0` matching the build-side parallel compression.
 
 - **Encrypted-package phase-1 regression and bidirectional encryption
   gate.** The format-negotiation refactor (`16e43ad8`) made
