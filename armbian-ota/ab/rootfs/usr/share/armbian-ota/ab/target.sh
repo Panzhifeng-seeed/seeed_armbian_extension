@@ -23,22 +23,42 @@ ab_extract_tar_payload() {
     local archive="$1"
     local target="$2"
     local label="$3"
-    local size
+    local size dec_cmd="cat"
 
     log_info "Extracting ${label} payload"
 
-    if command -v pv >/dev/null 2>&1; then
-        size="$(stat -c '%s' "${archive}" 2>/dev/null || true)"
-        if [ -n "${size}" ]; then
-            pv -f -n -s "${size}" "${archive}" 2> >(ab_log_extract_progress "${label}" >&2) |
-                tar --xattrs --acls --numeric-owner -xf - -C "${target}"
-        else
-            pv -f "${archive}" | tar --xattrs --acls --numeric-owner -xf - -C "${target}"
-        fi
-        return $?
+    # Codec dispatch by suffix, mirroring the recovery initramfs extractor
+    # (recovery/initramfs/recovery/payload.sh): the extraction always runs as
+    # an explicit "<decompressor> -dc | tar -xf -" pipeline, because GNU tar
+    # auto-detects compression only for named files and the pv progress stage
+    # below feeds tar's stdin. xz decodes with -T0: the payload is -T0
+    # compressed, and on-device timing showed parallel decode is the single
+    # biggest OTA wall-clock lever for xz packages.
+    case "${archive}" in
+        *.tar.xz)         dec_cmd="xz -T0 -dc" ;;
+        *.tar.zst|*.tzst) dec_cmd="zstd -dc" ;;
+        *.tar.gz|*.tgz)   dec_cmd="gzip -dc" ;;
+    esac
+
+    if [ "${dec_cmd}" != "cat" ]; then
+        command -v "${dec_cmd%% *}" >/dev/null 2>&1 ||
+            error_exit "Decompressor missing for ${archive}" \
+                "${dec_cmd%% *} not found; install xz-utils or zstd"
     fi
 
-    tar --xattrs --acls --numeric-owner -xzf "${archive}" -C "${target}"
+    (
+        set -o pipefail
+        if command -v pv >/dev/null 2>&1; then
+            size="$(stat -c '%s' "${archive}" 2>/dev/null || true)"
+            if [ -n "${size}" ]; then
+                pv -f -n -s "${size}" "${archive}" 2> >(ab_log_extract_progress "${label}" >&2)
+            else
+                pv -f "${archive}"
+            fi
+        else
+            cat "${archive}"
+        fi | ${dec_cmd} | tar --xattrs --acls --numeric-owner -xf - -C "${target}"
+    )
 }
 
 ab_write_target_state() {

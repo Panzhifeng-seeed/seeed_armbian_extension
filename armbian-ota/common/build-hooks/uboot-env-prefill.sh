@@ -145,10 +145,27 @@ for entry in blob[4:].split(b"\0"):
         break
     print(entry.decode("utf-8", "replace"))
 ')" || exit_with_error "Env blob readback failed" "${env_info}"
-    grep -q '^ota_rescue_boot=' <<< "${env_info}" ||
-        exit_with_error "Prefilled env lacks rescue boot script" "ota_rescue_boot not carried into blob"
-    grep -q '^bootcmd=.*ota_in_progress' <<< "${env_info}" ||
-        exit_with_error "Prefilled env lacks transactional bootcmd" "bootcmd not carried into blob"
+
+    # Profile-shaped readback check: A/B verifies the slot contract (raw-fit
+    # images additionally the injected boot mode), recovery keeps the v0.8
+    # routing-env checks.
+    if [[ "${AB_PART_OTA:-}" == "yes" ]]; then
+        grep -q '^bootcmd=.*armbian\.bootdev' <<< "${env_info}" ||
+            exit_with_error "Prefilled env lacks bootdev token" "bootcmd not carried into blob"
+        grep -q '^bootcmd=.*run ab_preboot' <<< "${env_info}" ||
+            exit_with_error "Prefilled env lacks slot bootcmd" "ab_preboot dispatch not carried into blob"
+        grep -q '^ab_preboot=' <<< "${env_info}" ||
+            exit_with_error "Prefilled env lacks slot retry script" "ab_preboot not carried into blob"
+        if ota_raw_boot_enabled; then
+            grep -q '^ab_boot_mode=raw-fit' <<< "${env_info}" ||
+                exit_with_error "Prefilled env lacks raw-fit mode" "ab_boot_mode not carried into blob"
+        fi
+    else
+        grep -q '^ota_rescue_boot=' <<< "${env_info}" ||
+            exit_with_error "Prefilled env lacks rescue boot script" "ota_rescue_boot not carried into blob"
+        grep -q '^bootcmd=.*ota_in_progress' <<< "${env_info}" ||
+            exit_with_error "Prefilled env lacks transactional bootcmd" "bootcmd not carried into blob"
+    fi
 
     display_alert "OTA U-Boot env prefill" "$(grep '^bootcmd=' <<< "${env_info}")" "info"
 }
