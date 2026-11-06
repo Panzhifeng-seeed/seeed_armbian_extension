@@ -12,8 +12,13 @@ slot_retry_left=3
 # Normalize the retry counter, then roll back after retry exhaustion.
 ab_preboot=if test "${ota_in_progress}" = "1"; then if test "${slot_retry_left}" -gt "${slot_retry_max}"; then setenv slot_retry_left ${slot_retry_max}; fi; if test "${slot_retry_left}" -le 0; then setenv boot_slot ${boot_success}; setenv ota_in_progress 0; setenv slot_retry_left ${slot_retry_max}; saveenv; reset; fi; setexpr slot_retry_left ${slot_retry_left} - 1; saveenv; fi
 
-# Select only the active A/B boot partition on the configured boot device.
-ab_select_boot_part=if test "${devtype}" = "${ab_boot_devtype}" && test "${devnum}" = "${ab_boot_devnum}"; then if test "${boot_slot}" = "b"; then setenv devplist ${distro_bootpart_b}; else setenv devplist ${distro_bootpart_a}; fi; else part list ${devtype} ${devnum} -bootable devplist; env exists devplist || setenv devplist 1; fi
+# Select only the active A/B boot partition, dual-shape. The distro shim
+# (6.1 chain) consumes devplist per scanned device; the bootstd bootcmd (v5)
+# consumes ab_scan_part for the single-partition scan. distro_bootpart_a/b
+# are written by armbian-ota-init-uboot; before that first run they are
+# unset and the bootable-flag fallback applies (boot_a, boot_slot always a
+# then).
+ab_select_boot_part=if test "${devtype}" = "${ab_boot_devtype}" && test "${devnum}" = "${ab_boot_devnum}"; then if test "${boot_slot}" = "b"; then setenv devplist ${distro_bootpart_b}; setenv ab_scan_part ${distro_bootpart_b}; else setenv devplist ${distro_bootpart_a}; setenv ab_scan_part ${distro_bootpart_a}; fi; else part list ${devtype} ${devnum} -bootable devplist; env exists devplist || setenv devplist 1; setenv ab_scan_part ${devplist}; fi
 
 # No boot_android here: our images carry no android boot partition, and each
 # call stomps android_dev_desc, which boot_fit later uses as its device
@@ -21,20 +26,21 @@ ab_select_boot_part=if test "${devtype}" = "${ab_boot_devtype}" && test "${devnu
 # "No boot partition" (RK3588 SD boot, 2026-09-03).
 # No fstype guard here: the v2025.04 vendor tree ships no fstype command, and
 # the load inside scan_dev_for_boot already fails cleanly on unsupported
-# filesystems, so the guard was redundant even where fstype exists.
+# filesystems, so the guard was redundant even where fstype exists(unused under the bootstd v5 chain).
 scan_dev_for_boot_part=run ab_select_boot_part; for distro_bootpart in ${devplist}; do run scan_dev_for_boot; done
 
 # Raw FIT boot path
 ab_select_fit_slot=if test "${boot_slot}" = "b"; then setenv boot_fit_part boot_b; else setenv boot_fit_part boot_a; fi
 
-# Dispatch to the path detected by armbian-ota-init-uboot.
-# armbian.bootdev/bootdevnum pass the storage U-Boot actually loaded the OS
-# image from (set by atags/rkimg_bootdev before bootcmd runs) so the initramfs
-# and userspace can anchor security/rootfs partition lookup to that disk when
-# several disks carry identical cloned images. The append sits AFTER ab_preboot
-# and BEFORE the mode dispatch so every branch (raw-fit slot boot, recovery
-# boot_fit) carries the token. It must stay after ab_preboot: that script
-# saveenv's during OTA retry handling and must never persist the mutated
-# bootargs, or the token accumulates across retry boots. No bootrkp tail: the
-# command does not exist in the u-boot we ship.
-bootcmd=run ab_preboot; setenv bootargs "${bootargs} armbian.bootdev=${devtype} armbian.bootdevnum=${devnum}"; if test "${ab_boot_mode}" = "raw-fit"; then run ab_select_fit_slot; setenv bootargs "${bootargs} armbian.slot=${boot_slot}"; boot_fit; else run distro_bootcmd; boot_fit; fi
+# Mode dispatch per armbian-ota-init-uboot. The armbian.bootdev token is
+# appended AFTER ab_preboot (that script saveenv's during retries and must
+# never persist mutated bootargs) and BEFORE the dispatch so both branches
+# carry it; devtype/devnum are decimal at this point. Filesystem branch,
+# dual-shape: bootstd chains (v5) scan exactly
+# "<devtype><devnum>:<ab_scan_part>" (single-partition bootflow, script
+# bootmeth runs its /boot.scr); 6.1 chains have no bootflow command, so the
+# fallback runs distro_bootcmd with the shim above constraining each scanned
+# device. A bootflow scan always returns success, so reaching the tail means
+# nothing booted: boot_fit closes the line on every chain (fast-fails on
+# ext4 images).
+bootcmd=run ab_preboot; setenv bootargs "${bootargs} armbian.bootdev=${devtype} armbian.bootdevnum=${devnum}"; if test "${ab_boot_mode}" = "raw-fit"; then run ab_select_fit_slot; setenv bootargs "${bootargs} armbian.slot=${boot_slot}"; boot_fit; else run ab_select_boot_part; if test -z "${ab_scan_part}"; then setenv ab_scan_part 1; fi; bootflow scan -b ${devtype}${devnum}:${ab_scan_part} || run distro_bootcmd; boot_fit; fi

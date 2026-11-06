@@ -94,9 +94,32 @@ function ota_ab_write_complete_initial_env() {
         return 1
     }
 
-    grep -q '^distro_bootcmd=' "${merged_env}" &&
-        grep -q '^scan_dev_for_boot=' "${merged_env}" &&
-        grep -q '^scan_dev_for_boot_part=' "${merged_env}" || {
+    # The packaged default env must be one of the two known boot shapes:
+    # distro machinery (6.1 legacy chains) or bootstd (v5 vendor tree) —
+    # the same tolerant pairing the extraction sanity check accepts. Checked
+    # on the default env itself, so the initial env's own bootflow text
+    # cannot mask a default-env-side gap.
+    grep -q '^distro_bootcmd=' "${default_env}" ||
+        grep -q 'bootflow' "${default_env}" || {
+        rm -f "${merged_env}"
+        return 1
+    }
+
+    # Merged-env sanity, dual-shape contract: the initial env must carry the
+    # full slot-boot bootcmd (token + ab_preboot entry, bootstd
+    # single-partition scan with the distro_bootcmd fallback for the 6.1
+    # legacy chains) plus the distro scan shim and the raw-fit slot selector,
+    # and the packaged default env must supply the vendor boot_targets string
+    # the fallback legs rely on.
+    grep -q '^bootcmd=.*armbian\.bootdev' "${merged_env}" &&
+        grep -q '^bootcmd=.*run ab_preboot' "${merged_env}" &&
+        grep -q '^bootcmd=.*bootflow scan' "${merged_env}" &&
+        grep -q '^bootcmd=.*run distro_bootcmd' "${merged_env}" &&
+        grep -q '^ab_preboot=' "${merged_env}" &&
+        grep -q '^ab_select_boot_part=' "${merged_env}" &&
+        grep -q '^ab_select_fit_slot=' "${merged_env}" &&
+        grep -q '^scan_dev_for_boot_part=' "${merged_env}" &&
+        grep -q '^boot_targets=' "${merged_env}" || {
         rm -f "${merged_env}"
         return 1
     }
