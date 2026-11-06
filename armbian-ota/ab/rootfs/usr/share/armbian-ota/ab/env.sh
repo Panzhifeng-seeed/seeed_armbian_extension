@@ -131,10 +131,21 @@ ab_env_slot_boot_ready() {
         return
     fi
 
+    # Filesystem slot boot, dual-shape. The bootcmd resolves the active
+    # slot's partition (ab_select_boot_part) and boots it through bootflow's
+    # single-partition scan on bootstd chains (vendor-next v5), falling back
+    # to distro_bootcmd — with the scan_dev_for_boot_part shim constraining
+    # every scanned device — on legacy distro chains (6.1), where the
+    # bootflow command does not exist. The armbian.bootdev token requirement
+    # mirrors the raw-fit branch: the same anchoring consumers (initramfs
+    # root anchor, ab partition lookup) run on filesystem images too.
     [[ "${boot_part_selector}" == *ab_boot_devtype* &&
         "${boot_part_selector}" == *boot_slot* &&
         "${scan}" == *"run ab_select_boot_part"* &&
-        "${bootcmd}" == *"run distro_bootcmd"* ]]
+        "${bootcmd}" == *"run distro_bootcmd"* &&
+        "${bootcmd}" == *"run ab_select_boot_part"* &&
+        "${bootcmd}" == *bootflow* &&
+        "${bootcmd}" == *armbian.bootdev* ]]
 }
 
 ab_env_prepare() {

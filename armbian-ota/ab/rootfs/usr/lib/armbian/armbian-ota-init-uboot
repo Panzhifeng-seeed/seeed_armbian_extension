@@ -137,6 +137,11 @@ detect_ab_boot_configuration() {
     # slot switch dies in ab_select_boot_part's mismatch fallback.
     BOOT_DEVTYPE="$(sed -n 's/.*[[:space:]]armbian\.bootdev=\([^[:space:]]*\).*/\1/p' /proc/cmdline)"
     BOOT_DEVNUM="$(sed -n 's/.*[[:space:]]armbian\.bootdevnum=\([^[:space:]]*\).*/\1/p' /proc/cmdline)"
+    # Same 0x-strip as the other token consumers: the bootstd script bootmeth
+    # hex-prefixes devnum in the token, while ab_boot_devnum is compared
+    # against U-Boot's decimal pre-pollution devnum and boot_targets must
+    # stay a well-formed bootdev label ("nvme0").
+    case "${BOOT_DEVNUM}" in 0x*) BOOT_DEVNUM="${BOOT_DEVNUM#0x}" ;; esac
     if [ -z "${BOOT_DEVTYPE}" ] || [ -z "${BOOT_DEVNUM}" ]; then
         read -r BOOT_DEVTYPE BOOT_DEVNUM <<< "$(get_uboot_bootdev_from_part "${boot_a_dev}" || true)"
     fi

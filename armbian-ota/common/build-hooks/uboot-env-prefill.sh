@@ -53,13 +53,14 @@ function ota_uboot_env_prefill_compose() {
 
         if ota_raw_boot_enabled; then
             # Raw-FIT images must take the bootcmd's raw-fit branch from the
-            # very first boot. The else-branch runs distro_bootcmd first, and
-            # its per-device boot_android calls repoint android_get_bootdev()
-            # at whatever device was scanned last (the SPI mtd on boards with
-            # NOR flash), so the trailing boot_fit then searches the wrong
-            # device and dies with "No boot partition" (RK3588 SD boot,
-            # 2026-09-03). ota-init only sets this mode after a bootstrapped
-            # first boot, which never happens without this injection.
+            # very first boot. Without the injection ab_boot_mode is unset,
+            # so the bootcmd takes the filesystem else-branch, which cannot
+            # boot a raw partition on any chain (no filesystem, no boot.scr
+            # for the bootflow scan, no bootable ext4 for the distro scan)
+            # before boot_fit finally gets its turn. Injecting the mode makes
+            # the first boot go straight to the slot-selecting boot_fit.
+            # ota-init only sets this mode after a bootstrapped first boot,
+            # which never happens without this injection.
             raw_override_env="$(mktemp)" || exit_with_error "mktemp failed"
             printf 'ab_boot_mode=raw-fit\n' > "${raw_override_env}"
             ota_ab_merge_uboot_env_files "${final_env}" "${src_env}" "${raw_override_env}"
@@ -145,10 +146,27 @@ for entry in blob[4:].split(b"\0"):
         break
     print(entry.decode("utf-8", "replace"))
 ')" || exit_with_error "Env blob readback failed" "${env_info}"
-    grep -q '^ota_rescue_boot=' <<< "${env_info}" ||
-        exit_with_error "Prefilled env lacks rescue boot script" "ota_rescue_boot not carried into blob"
-    grep -q '^bootcmd=.*ota_in_progress' <<< "${env_info}" ||
-        exit_with_error "Prefilled env lacks transactional bootcmd" "bootcmd not carried into blob"
+
+    # Profile-shaped readback check: A/B verifies the slot contract (raw-fit
+    # images additionally the injected boot mode), recovery keeps the v0.8
+    # routing-env checks.
+    if [[ "${AB_PART_OTA:-}" == "yes" ]]; then
+        grep -q '^bootcmd=.*armbian\.bootdev' <<< "${env_info}" ||
+            exit_with_error "Prefilled env lacks bootdev token" "bootcmd not carried into blob"
+        grep -q '^bootcmd=.*run ab_preboot' <<< "${env_info}" ||
+            exit_with_error "Prefilled env lacks slot bootcmd" "ab_preboot dispatch not carried into blob"
+        grep -q '^ab_preboot=' <<< "${env_info}" ||
+            exit_with_error "Prefilled env lacks slot retry script" "ab_preboot not carried into blob"
+        if ota_raw_boot_enabled; then
+            grep -q '^ab_boot_mode=raw-fit' <<< "${env_info}" ||
+                exit_with_error "Prefilled env lacks raw-fit mode" "ab_boot_mode not carried into blob"
+        fi
+    else
+        grep -q '^ota_rescue_boot=' <<< "${env_info}" ||
+            exit_with_error "Prefilled env lacks rescue boot script" "ota_rescue_boot not carried into blob"
+        grep -q '^bootcmd=.*ota_in_progress' <<< "${env_info}" ||
+            exit_with_error "Prefilled env lacks transactional bootcmd" "bootcmd not carried into blob"
+    fi
 
     display_alert "OTA U-Boot env prefill" "$(grep '^bootcmd=' <<< "${env_info}")" "info"
 }
