@@ -6,7 +6,7 @@ release chain, CI builds. The always-on hardening features live in
 
 1. [repack-fit.sh — offline FIT re-signing](#1-repack-fitsh--offline-fit-re-signing)
 2. [Deb packaging and release chain](#2-deb-packaging-and-release-chain)
-3. [CI builds (Seeed Build workflow)](#3-ci-builds-seeed-build-workflow)
+3. [CI builds (Images Build workflow)](#3-ci-builds-images-build-workflow)
 
 ## 1. repack-fit.sh — offline FIT re-signing
 
@@ -41,28 +41,47 @@ warns before falling back to a tree mkimage; the result is verified with
 
 ## 2. Deb packaging and release chain
 
-Three scripts, normally driven by CI ([below](#3-ci-builds-seeed-build-workflow)):
+Three scripts, normally driven by CI ([below](#3-ci-builds-images-build-workflow)):
 
 | Script | Purpose |
 |---|---|
 | [`build-all-debs.sh`](../scripts/build-all-debs.sh) | Build the five board debs (FCS960K AI camera, Morse WiFi tools, USB gadget) into an output dir |
-| [`generate-deb-index.sh`](../scripts/generate-deb-index.sh) | Generate the repository index HTML (categories, apt usage snippets, stats) |
-| [`publish-aptly.sh`](../scripts/publish-aptly.sh) | Publish debs into an aptly repo (`stable`/`main`/arm64), export the GPG key — requires `ARMBIAN_APT_GPG_KEY_ID` |
+| [`generate-deb-index.sh`](../.github/scripts/generate-deb-index.sh) | Generate the repository index HTML (categories, apt usage snippets, stats) |
+| [`publish-aptly.sh`](../.github/scripts/publish-aptly.sh) | Publish debs into an aptly repo (`stable`/`main`/arm64), export the GPG key — requires `ARMBIAN_APT_GPG_KEY_ID` |
 
 Local use example:
 
 ```bash
 ./scripts/build-all-debs.sh out/debs
-ARMBIAN_APT_GPG_KEY_ID=<gpg-key-id> ./scripts/publish-aptly.sh out/debs
+ARMBIAN_APT_GPG_KEY_ID=<gpg-key-id> ./.github/scripts/publish-aptly.sh out/debs
 ```
 
-## 3. CI builds (Seeed Build workflow)
+`APT - Build & Publish` deploys the resulting repository to the current
+pipeline owner's **root Pages** at `https://<owner>.github.io/`, not the
+extension repository's project Pages. The APT source is therefore:
 
-[`.github/workflows/seeed-build.yml`](../.github/workflows/seeed-build.yml)
+```bash
+curl -fsSL https://<owner>.github.io/seeed-repo.gpg \
+  | sudo gpg --dearmor -o /usr/share/keyrings/seeed-repo.gpg
+echo "deb [signed-by=/usr/share/keyrings/seeed-repo.gpg] https://<owner>.github.io/ stable main" \
+  | sudo tee /etc/apt/sources.list.d/seeed.list
+```
+
+Before the first dispatch, create the `<owner>/<owner>.github.io` repository
+and select **Deploy from a branch → `gh-pages` / `/ (root)`** in its Pages
+settings. Set `PAGES_TARGET_TOKEN` on the extension repository to a PAT that
+can write that repository's contents and trigger its Pages builds. Deployment
+replaces only the APT-managed `index.html`, GPG key, `dists/` and `pool/`;
+unrelated content elsewhere on the Owner Pages is preserved. A publish does
+not create the target repository or change its Pages settings.
+
+## 3. CI builds (Images Build workflow)
+
+[`.github/workflows/build-images.yml`](../.github/workflows/build-images.yml)
 builds firmware on GitHub Actions — useful when you want images without a
 local build environment.
 
-**Trigger**: Actions → *Seeed Build* → *Run workflow*. Select via checkboxes:
+**Trigger**: Actions → *Images - Build & Pre-release* → *Run workflow*. Select via checkboxes:
 
 - boards (rk3576 / rk3588 / rk3576 module devkits), releases (trixie / resolute), tier (cli / mid)
 - OTA mode (recovery / ab), security (plain / **secure-boot**)
@@ -76,15 +95,46 @@ needs **before** the multi-hour build starts:
 | `PRIVATE_KEY_PEM` | FIT signing private key; staged into `cache/sources/fit-keys` and fed to the build via `UBOOT_FIT_KEYS_BACKUP_DIR` ([06 §3](06-secure-boot.md#3-signing-keys-keep-them-or-regenerate-them)) | `secure-boot` |
 | `DEV_CRT` | matching signing certificate (`dev.crt`); preflight checks it matches the private key | `secure-boot` |
 | `CRYPTROOT_PASSPHRASE` | LUKS rootfs passphrase, exactly 64 *hex* characters ([05](05-encryption.md)); preflight checks length only | `secure-boot` |
-| `ARMBIAN_BUILD_RELEASE_TOKEN` | GitHub token for publishing the Release | `publish_release` |
-| `RCLONE_CONFIG` | rclone remote config for the OneDrive upload | `upload_onedrive` |
+| `RELEASE_GH_TOKEN` | GitHub token for publishing the Release to a different `release_repo`; falls back to the workflow's own token | cross-repo `release_repo` |
+| `RCLONE_CONFIG` | rclone remote config for OneDrive image publication | always |
 
-Optional: `publish_release` creates a GitHub Release with download tables;
-the release page prose lives in [`.github/release-body.md`](../.github/release-body.md)
-— CI fills in the per-board tables and OneDrive links.
-OneDrive upload is available via the `upload_onedrive` input. Artifacts are
-attached to the workflow run (`actions/upload-artifact`) — download from the
-run page, flash as usual.
+Every run creates a draft pre-release in `release_repo` (a same-tag release
+from a re-run is deleted first). **Image/OTA binaries upload only to
+OneDrive; GitHub Release assets are not supported.** The Release remains
+version metadata, a pre-release/stable marker, and a link to the build run.
+The immutable mirror layout is tag-addressed:
+
+```
+armbian/<owner>/images/trees/<tag>/<board>/<plain|secure>/<recovery|ab|loaders>/
+```
+
+`slots.json` identifies the current pre-release, stable and history tags.
+After all matrix entries upload, the release job creates a per-file share
+link and writes them to `trees/<tag>/manifest.json`, then points
+`slots.json.pre-release` at the tag and flips the Release visible.
+Promotion validates the complete referenced trees, updates the pointers
+(`stable ⟵ pre-release`, previous stable joins the bounded history), and
+moves no image files. The OneDrive tree for an expired stable may be
+purged, but its GitHub Release is retained as historical metadata.
+`Pages - Refresh` (`refresh-pages.yml`) re-renders the page from the live
+manifest state, for example after manual OneDrive cleanup.
+
+Board u-boot **production loaders** live inside the same tag tree, at
+`<board>/<plain|secure>/loaders/`.
+
+`spl_loader_maskrom.bin` (maskrom flashing loader) exists for every board;
+`rkspi_loader.img` (SPI NOR image) only for layouts that build one
+(`BOOT_SUPPORT_SPI` boards — devkit today). `secure/` holds the signed
+rebuilds (signed FIT, `rk_sign_tool`-signed loader) and never shares a
+directory with `plain/`. Only the reference leg (cli/trixie/recovery)
+uploads — the u-boot payload is identical across the other legs of the same
+`board+security`. Promote only flips the tag pointers; loader files stay
+inside their tag tree.
+
+The download page renders them per board as a first-class **Loader** mode
+box (chip icon, teal/orange buttons) at the top of each security group
+(green PLAIN / red SECURE frames with inverted corner labels). All image
+and loader links come from the tag's OneDrive manifest.
 
 Everything CI does is the documented local flow — the wrapper staging step,
 profiles, and secrets map 1:1 to [02-build-reference.md](02-build-reference.md).

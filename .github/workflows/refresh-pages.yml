@@ -1,0 +1,65 @@
+name: "Pages - Refresh"
+
+# Rebuild the images page from live mirror manifests; never modify the mirror.
+# Abort on unreadable manifests instead of publishing missing links.
+
+on:
+  workflow_dispatch:
+
+# Serialize mirror reads with builds and promotions.
+concurrency:
+  group: images-mirror
+  cancel-in-progress: false
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Probe secrets
+        id: probe
+        env:
+          RCLONE_CONFIG: ${{ secrets.RCLONE_CONFIG }}
+          PAGES_TARGET_TOKEN: ${{ secrets.PAGES_TARGET_TOKEN }}
+        run: |
+          if [ -z "$PAGES_TARGET_TOKEN" ]; then
+            echo "::error::PAGES_TARGET_TOKEN is not set — a refresh cannot update the page; aborting instead of reporting a false success."
+            exit 1
+          fi
+          if [ -z "$RCLONE_CONFIG" ]; then
+            echo "::error::RCLONE_CONFIG is not set — a refresh would strip all file links from the page; aborting."
+            exit 1
+          fi
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup rclone (seeed-storage OneDrive remote)
+        uses: ./.github/actions/setup-onedrive
+        with:
+          rclone_config: ${{ secrets.RCLONE_CONFIG }}
+
+      - name: Check the manifest is readable
+        id: mirror
+        run: |
+          set -euo pipefail
+          release_repo="${GITHUB_REPOSITORY_OWNER}/armbian-build"
+          echo "release_repo=$release_repo" >> "$GITHUB_OUTPUT"
+          echo "release repo: $release_repo"
+          if ! rclone cat "seeed-storage:armbian/${GITHUB_REPOSITORY_OWNER,,}/images/slots.json" --contimeout 15s > /dev/null 2> cat.err; then
+            echo "::error::slots.json unreadable — OneDrive unreachable, or the mirror's pointer file is gone. Restore it by hand: list trees/, then write {stable, pre-release, history} with the tags each slot should serve. $(tr '\n' ' ' < cat.err)"
+            exit 1
+          fi
+          echo "slots.json OK"
+
+      - name: Deploy images page
+        uses: ./.github/actions/deploy-pages
+        with:
+          tag: refresh
+          repo: ${{ steps.mirror.outputs.release_repo }}
+          release_repo: ${{ steps.mirror.outputs.release_repo }}
+          rclone_config: ${{ secrets.RCLONE_CONFIG }}
+          pages_token: ${{ secrets.PAGES_TARGET_TOKEN }}
+          gh_token: ${{ secrets.RELEASE_GH_TOKEN || github.token }}

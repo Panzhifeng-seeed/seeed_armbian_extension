@@ -1,18 +1,18 @@
-name: "Images - Build matrix"
+name: "Images - Build & Pre-release"
+
+# OneDrive carries image binaries; Releases carry version metadata only.
 
 on:
   workflow_dispatch:
     inputs:
-      # ── Build source (which repo:branch to build from).
+      # ── Build source (which armbian-build branch to build from).
       armbian_build_repo:
         description: "armbian-build source (repo:branch; repo must be <owner>/armbian-build)"
         required: false
         type: string
         default: "armbian-build:main"
 
-      # ── Boards (all on by default; missing boards are skipped in plan).
-      # Input names ARE the board ids — plan derives the list from
-      # toJSON(inputs); adding a board is one input here, nothing else.
+      # Board input names are the matrix board ids.
       recomputer-rk3576-devkit:
         description: "Board: reComputer rk3576 DevKit"
         type: boolean
@@ -30,8 +30,7 @@ on:
         type: boolean
         default: true
 
-      # ── Variants (always both): cli → Debian 13 trixie (--minimal);
-      #    gnome → Ubuntu 26.04 resolute (desktop, sized by desktop_tier).
+      # cli = Debian trixie minimal; gnome = Ubuntu resolute desktop.
 
       # ── OTA modes (each becomes a matrix entry). recovery mandatory; ab opt-in.
       ota_ab:
@@ -57,89 +56,42 @@ on:
         default: mid
 
 env:
+  # Current armbian-build requires the ccache extension.
+  ENABLE_EXTENSIONS: "ccache"
   PRIVATE_CCACHE: "yes"
-  USE_CCACHE: "yes"
   ENABLE_SEEED_RK_EXTENSION: "yes"
   KERNEL_CONFIGURE: "no"
   VENDOR: "Armbian"
   DOCKER_IMAGE: "ghcr.io/armbian/docker-armbian-build:armbian-ubuntu-noble-latest"
 
+# Serialize mirror writers with promote/refresh.
+# Only one run waits in this group; later dispatches evict the queued run.
 concurrency:
-  group: images-build
+  group: images-mirror
   cancel-in-progress: false
 
 jobs:
-  # secrets.* not allowed in step-level if:, so probe it once here.
   preflight:
-    # Fail fast on malformed secrets BEFORE the multi-hour build.
-    needs: probe-secrets
+    # Validate secrets before the multi-hour build; source repos are public.
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
       contents: read
-    env:
-      HAS_RCLONE: ${{ needs.probe-secrets.outputs.has_rclone }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup rclone (seeed-storage OneDrive remote)
-        if: ${{ env.HAS_RCLONE == 'true' }}
-        uses: ./.github/actions/setup-onedrive
+      - name: Run preflight checks
+        uses: ./.github/actions/preflight-checks
         with:
+          secure_boot: ${{ inputs.secure_boot }}
           rclone_config: ${{ secrets.RCLONE_CONFIG }}
-
-      - name: Check OneDrive mirror availability (hard gate)
-        if: ${{ env.HAS_RCLONE == 'true' }}
-        run: |
-          set -euo pipefail
-          if ! rclone lsd seeed-storage:armbian/images --max-depth 1 --contimeout 15s >/dev/null 2>&1; then
-            echo "::error::rclone cannot reach seeed-storage:armbian/images — create the folder on OneDrive first, or refresh the RCLONE_CONFIG token."
-            exit 1
-          fi
-          echo "OneDrive remote OK. Quota:"
-          rclone about seeed-storage: 2>/dev/null | grep -E 'Total:|Free:|Trashed:' || true
-
-      - name: OneDrive mode notice (no secret)
-        # Fork path: assets go to the GitHub release instead.
-        if: ${{ env.HAS_RCLONE != 'true' }}
-        run: |
-          echo "::notice::RCLONE_CONFIG is not set — GitHub-assets mode (fork): binaries are attached to the release; OneDrive upload and image-promote are skipped."
-
-      - name: Validate secure-boot secrets
-        if: ${{ inputs.secure_boot }}
-        env:
-          PRIVATE_KEY_PEM: ${{ secrets.PRIVATE_KEY_PEM }}
-          DEV_CRT: ${{ secrets.DEV_CRT }}
-          CRYPTROOT_PASSPHRASE: ${{ secrets.CRYPTROOT_PASSPHRASE }}
-        run: |
-          set -euo pipefail
-          fail=0
-          err() { echo "::error::$1"; fail=1; }
-
-          [ -n "$PRIVATE_KEY_PEM" ] || err "secret PRIVATE_KEY_PEM is empty (secure_boot selected)"
-          [ -n "$DEV_CRT" ]        || err "secret DEV_CRT is empty (secure_boot selected)"
-          [ "${#CRYPTROOT_PASSPHRASE}" -eq 64 ] \
-            || err "CRYPTROOT_PASSPHRASE must be exactly 64 chars, got ${#CRYPTROOT_PASSPHRASE}"
-          if [ -n "$PRIVATE_KEY_PEM" ]; then
-            printf '%s\n' "$PRIVATE_KEY_PEM" | openssl rsa -check -noout >/dev/null 2>&1 \
-              || err "PRIVATE_KEY_PEM is not a parsable RSA key"
-          fi
-          if [ -n "$DEV_CRT" ]; then
-            printf '%s\n' "$DEV_CRT" | openssl x509 -noout >/dev/null 2>&1 \
-              || err "DEV_CRT is not a parsable x509 certificate"
-          fi
-          if [ -n "$PRIVATE_KEY_PEM" ] && [ -n "$DEV_CRT" ]; then
-            key_pub=$(printf '%s\n' "$PRIVATE_KEY_PEM" | openssl rsa -pubout 2>/dev/null | openssl md5)
-            crt_pub=$(printf '%s\n' "$DEV_CRT" | openssl x509 -pubkey -noout 2>/dev/null | openssl md5)
-            [ "$key_pub" = "$crt_pub" ] || err "PRIVATE_KEY_PEM does not match DEV_CRT"
-          fi
-
-          [ "$fail" -eq 0 ] || exit 1
-          echo "Secure-boot secrets present and well-formed."
+          private_key_pem: ${{ secrets.PRIVATE_KEY_PEM }}
+          dev_crt: ${{ secrets.DEV_CRT }}
+          cryptroot_passphrase: ${{ secrets.CRYPTROOT_PASSPHRASE }}
 
   plan:
-    needs: [probe-secrets, preflight]
+    needs: [preflight]
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -147,13 +99,19 @@ jobs:
       matrix: ${{ steps.gen.outputs.matrix }}
       boards: ${{ steps.gen.outputs.boards }}
       count: ${{ steps.gen.outputs.count }}
+      tag: ${{ steps.gen.outputs.tag }}
       ab_repo: ${{ steps.gen.outputs.ab_repo }}
       ab_commit: ${{ steps.source.outputs.ab_commit }}
+      release_repo: ${{ steps.gen.outputs.release_repo }}
     steps:
       - name: Generate matrix JSON from checkbox inputs
         id: gen
         run: |
           set -euo pipefail
+
+          # Resolve one tag for the whole run; failed-job reruns resume it.
+          tag="$(date -u +%y%m%d-%H%M%S)"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
 
           python3 <<'PY'
           import json, os, itertools
@@ -162,7 +120,7 @@ jobs:
               v = os.environ.get(name, "false").strip().lower()
               return v in ("true", "1", "yes", "on")
 
-          # Board ids are the input names — the form is the single source of truth.
+          # Board ids come from the dispatch input names.
           inputs = json.loads(os.environ["INPUTS_JSON"])
           boards = sorted(
               k for k, v in inputs.items()
@@ -172,9 +130,7 @@ jobs:
           if not boards:
               raise SystemExit("ERROR: select at least one board")
 
-          # Boards missing from the chosen armbian-build source are dropped
-          # (e.g. industrial until it merges). API hiccups keep the board —
-          # the build then fails loudly instead of being silently skipped.
+          # Skip missing boards; on API errors, keep them and fail at build.
           import urllib.request, urllib.error
           ab_repo = os.environ.get("AB_REPO", "").strip()
           if not ab_repo:
@@ -186,6 +142,11 @@ jobs:
               ab_repo = f"{owner}/{repo_part}:{branch_part}"
           repo, _, branch = ab_repo.partition(":")
           branch = branch or "main"
+          expected_repo = f"{os.environ['GITHUB_REPOSITORY_OWNER']}/armbian-build"
+          if repo != expected_repo:
+              raise SystemExit(
+                  f"ERROR: build source repo must be {expected_repo}, got {repo}; "
+                  "promote and page deployment share that repository contract")
 
           def board_exists(board):
               headers = {"Accept": "application/vnd.github+json"}
@@ -246,11 +207,15 @@ jobs:
 
           boards_unique = list(dict.fromkeys(boards))
 
+          # release_repo: use the armbian-build repo (without branch)
+          release_repo = repo
+
           with open(os.environ["GITHUB_OUTPUT"], "a") as f:
               f.write(f"matrix={json.dumps({'include': entries})}\n")
               f.write(f"boards={json.dumps(boards_unique)}\n")
               f.write(f"count={len(entries)}\n")
               f.write(f"ab_repo={ab_repo}\n")
+              f.write(f"release_repo={release_repo}\n")
           PY
         env:
           INPUTS_JSON: ${{ toJSON(inputs) }}
@@ -262,7 +227,9 @@ jobs:
       - name: Print summary
         run: |
           echo "Total matrix entries: ${{ steps.gen.outputs.count }}"
-          echo "Boards to build: ${{ steps.gen.outputs.boards }}"
+          echo "Boards to release: ${{ steps.gen.outputs.boards }}"
+          echo "Release tag: ${{ steps.gen.outputs.tag }}"
+          echo "Release target: ${{ steps.gen.outputs.release_repo }}"
           echo "armbian-build: ${{ steps.gen.outputs.ab_repo }}"
 
       - name: Resolve immutable build-source revision
@@ -276,8 +243,150 @@ jobs:
           [[ "$ab_commit" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::invalid armbian-build commit"; exit 1; }
           echo "ab_commit=$ab_commit" >> "$GITHUB_OUTPUT"
           echo "Pinned armbian-build source: ${AB_REPO%:*}@$ab_commit"
+
+  # Create one draft Release and reset this run's mirror tree.
+  init-release:
+    name: Init draft release
+    needs: [plan]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup rclone (seeed-storage OneDrive remote)
+        uses: ./.github/actions/setup-onedrive
+        with:
+          rclone_config: ${{ secrets.RCLONE_CONFIG }}
+
+      - name: Read the current candidate
+        id: retire
+        run: |
+          set -euo pipefail
+          IBASE="seeed-storage:armbian/${GITHUB_REPOSITORY_OWNER,,}/images"
+          rclone cat "$IBASE/slots.json" --contimeout 15s > slots.json
+          jq -e 'type == "object"' slots.json >/dev/null
+          old="$(jq -r '."pre-release" // empty' slots.json)"
+          echo "current candidate: ${old:-<none>}"
+          echo "tag=$old" >> "$GITHUB_OUTPUT"
+
+      - name: Retire the current candidate before building
+        if: ${{ steps.retire.outputs.tag != '' }}
+        run: |
+          set -euo pipefail
+          IBASE="seeed-storage:armbian/${GITHUB_REPOSITORY_OWNER,,}/images"
+          jq '."pre-release" = null' slots.json > slots.next
+          rclone cat "$IBASE/slots.json" --contimeout 15s > slots.current
+          cmp slots.json slots.current \
+            || { echo "::error::slots.json changed before retirement; refusing to overwrite"; exit 1; }
+          rclone rcat "$IBASE/slots.json" < slots.next
+
+      - name: Hide the retired candidate before deleting its tree
+        if: ${{ steps.retire.outputs.tag != '' }}
+        uses: ./.github/actions/deploy-pages
+        with:
+          tag: retire-${{ needs.plan.outputs.tag }}
+          repo: ${{ needs.plan.outputs.release_repo }}
+          release_repo: ${{ needs.plan.outputs.release_repo }}
+          rclone_config: ${{ secrets.RCLONE_CONFIG }}
+          pages_token: ${{ secrets.PAGES_TARGET_TOKEN }}
+          gh_token: ${{ secrets.RELEASE_GH_TOKEN || github.token }}
+
+      - name: Reset this run's staging tree
+        id: reset
+        # Clear the candidate pointer and hide its page before deleting its tree.
+        # History GC belongs to Images - Release.
+        env:
+          TAG: ${{ needs.plan.outputs.tag }}
+        run: |
+          set -euo pipefail
+          IBASE="seeed-storage:armbian/${GITHUB_REPOSITORY_OWNER,,}/images"
+          if [ -n "${{ steps.retire.outputs.tag }}" ]; then
+            rclone purge "$IBASE/trees/${{ steps.retire.outputs.tag }}" --contimeout 15s
+          fi
+          if ! rclone lsd "$IBASE/trees/$TAG" --contimeout 15s > tree.check 2> tree.error; then
+            if grep -qi 'not found' tree.error; then
+              echo "$IBASE/trees/$TAG is a fresh tag — nothing to purge"
+            else
+              echo "::error::cannot verify $IBASE/trees/$TAG before resetting it"
+              cat tree.error >&2
+              exit 1
+            fi
+          else
+            rclone purge "$IBASE/trees/$TAG" --contimeout 15s
+          fi
+
+      - name: Remove the retired candidate Release
+        if: ${{ steps.retire.outputs.tag != '' }}
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_GH_TOKEN || github.token }}
+          TARGET_REPO: ${{ needs.plan.outputs.release_repo }}
+          OLD_TAG: ${{ steps.retire.outputs.tag }}
+        run: |
+          set -euo pipefail
+          if ! state="$(gh release view "$OLD_TAG" --repo "$TARGET_REPO" \
+            --json isDraft,isPrerelease,assets,body --jq '[.isDraft,.isPrerelease,(.assets|length),.body]|@json' 2>&1)"; then
+            grep -qi 'release not found' <<<"$state" \
+              && { echo "retired candidate Release $OLD_TAG is already absent"; exit 0; }
+            echo "::error::cannot read retired Release $OLD_TAG; refusing cleanup: $state"
+            exit 1
+          fi
+          if [ "$(jq -r '.[0] or (.[1]|not) or (.[2] > 0)' <<<"$state")" = "true" ]; then
+            echo "::error::$OLD_TAG is not an asset-less pre-release; refusing to delete it"
+            exit 1
+          fi
+          jq -r '.[3]' <<<"$state" | grep -qE "${GITHUB_REPOSITORY}/actions/runs/[0-9]+" \
+            || { echo "::error::$OLD_TAG is not owned by this pipeline; refusing to delete it"; exit 1; }
+          gh release delete "$OLD_TAG" --repo "$TARGET_REPO" --yes --cleanup-tag
+
+      - name: Create draft release ${{ needs.plan.outputs.tag }}
+        env:
+          # RELEASE_GH_TOKEN is required for cross-repo Releases.
+          GH_TOKEN: ${{ secrets.RELEASE_GH_TOKEN || github.token }}
+          TARGET_REPO: ${{ needs.plan.outputs.release_repo }}
+          TAG: ${{ needs.plan.outputs.tag }}
+          BOARDS: ${{ needs.plan.outputs.boards }}
+          MATRIX: ${{ needs.plan.outputs.matrix }}
+        run: |
+          set -euo pipefail
+          # Re-run all replaces this run's owned prerelease.
+          if ! state="$(gh release view "$TAG" --repo "$TARGET_REPO" \
+            --json isDraft,isPrerelease,body --jq '[.isDraft,.isPrerelease,.body]|@json' 2>&1)"; then
+            grep -qi 'release not found' <<<"$state" || {
+              echo "::error::cannot read Release $TAG; refusing to replace it: $state"
+              exit 1
+            }
+          else
+            [ "$(jq -r '.[1]' <<<"$state")" = "true" ] \
+              || { echo "::error::$TAG is not a pre-release; refusing to replace it"; exit 1; }
+            jq -r '.[2]' <<<"$state" | grep -qE "${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}([/[:space:]]|$)" \
+              || { echo "::error::$TAG is not owned by run ${GITHUB_RUN_ID}; refusing to replace it"; exit 1; }
+            gh release delete "$TAG" --repo "$TARGET_REPO" --yes
+            gh api --method DELETE "repos/$TARGET_REPO/git/refs/tags/$TAG" >/dev/null 2>&1 || true
+          fi
+          # --target must name a ref of the RELEASE repo.
+          target_args=()
+          if [ "$TARGET_REPO" = "$GITHUB_REPOSITORY" ]; then
+            target_args=(--target "$GITHUB_SHA")
+          fi
+          # Title derives from the UTC tag; the tree manifest holds metadata.
+          boards_n="$(jq length <<<"$BOARDS")"
+          images_n="$(jq '.include | length' <<<"$MATRIX")"
+          title="Images 20${TAG:0:2}-${TAG:2:2}-${TAG:4:2} ${TAG:7:2}:${TAG:9:2} UTC · ${boards_n} boards · ${images_n} images"
+          gh release create "${TAG}" \
+            --repo "$TARGET_REPO" \
+            --draft \
+            --prerelease \
+            --title "$title" \
+            "${target_args[@]}" \
+            --notes "Binaries are published only in the OneDrive mirror; this Release carries version metadata. Downloads are on the images page. Run: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+
+  # Re-run failed jobs resumes the candidate; re-run all rebuilds it.
+
   build:
-    needs: [preflight, plan]
+    needs: [plan, init-release]
     runs-on: ubuntu-26.04
     timeout-minutes: 360
     permissions:
@@ -287,13 +396,14 @@ jobs:
       matrix:
         include: ${{ fromJSON(needs.plan.outputs.matrix).include }}
     env:
+      TAG: ${{ needs.plan.outputs.tag }}
       EXTENSION_SHA: ${{ github.sha }}
+      BUILD_SOURCE_REPO: ${{ needs.plan.outputs.release_repo }}
       BUILD_SOURCE_SHA: ${{ needs.plan.outputs.ab_commit }}
       BOARD: ${{ matrix.board }}
 
     steps:
-      # Extension rev is pinned inside armbian-build's seeed-extension.sh
-      # (SEEED_EXTENSION_REF), so no ref input here.
+      # Build uses the exact workflow extension revision.
       - name: Checkout extension (default branch)
         uses: actions/checkout@v4
         with:
@@ -321,8 +431,7 @@ jobs:
           df -h /
 
       - name: Install qemu-user-binfmt for cross-arch rootfs chroot
-        # qemu-user-binfmt registers qemu-aarch64 etc on the host with the
-        # fix-binary flag so containers can chroot into arm64 rootfs.
+        # Host binfmt lets containers chroot into arm64 rootfs.
         run: |
           sudo apt-get update
           sudo apt-get install -y qemu-user-binfmt binfmt-support
@@ -332,8 +441,7 @@ jobs:
           cat /proc/sys/fs/binfmt_misc/qemu-aarch64 2>/dev/null || echo "qemu-aarch64 not registered"
 
       - name: Resolve armbian-build repo
-        # input is repo:branch or owner/repo:branch — validate and split.
-        # Auto-prepends repo owner if missing (plan-resolved).
+        # Validate the plan-resolved source and use its immutable commit.
         id: abrepo
         env:
           AB_REPO: ${{ needs.plan.outputs.ab_repo }}
@@ -377,17 +485,14 @@ jobs:
           cd armbian-build
           sed -i '/"--env" "ARMBIAN_RUNNING_IN_CONTAINER=yes"/a\\t\t"--env" "CRYPTROOT_PASSPHRASE=${CRYPTROOT_PASSPHRASE:-}"' \
               lib/functions/host/docker.sh
-          # Same container boundary: SEEED_EXTENSION_REPO/REF exported on the
-          # host never reach the wrapper sourcing inside the container, so the
-          # extension fetch silently falls back to upstream main.
+          # Forward the extension source across the Docker boundary.
           sed -i '/"--env" "CRYPTROOT_PASSPHRASE=/a\\t\t"--env" "SEEED_EXTENSION_REPO=${SEEED_EXTENSION_REPO:-}"\n\t\t"--env" "SEEED_EXTENSION_REF=${SEEED_EXTENSION_REF:-}"' \
               lib/functions/host/docker.sh
           echo "=== env forwarding in docker.sh ==="
           grep -nE 'CRYPTROOT_PASSPHRASE|SEEED_EXTENSION_(REPO|REF)' lib/functions/host/docker.sh
 
       - name: Patch radxa-aic8800 extension against GitHub API flakiness
-        # api.github.com flakes on CI; upstream resolves the version to
-        # "null" and wget 404s. Patch adds version pin + cache fallback.
+        # Pin AIC8800 and cache downloads to tolerate API failures.
         run: |
           cd armbian-build
           git apply "${GITHUB_WORKSPACE}/.github/patchs/radxa-aic8800.sh.patch"
@@ -449,15 +554,9 @@ jobs:
             ccache-arm64-${{ matrix.board }}-vendor-
             ccache-arm64-${{ matrix.board }}-
 
-      # rootfs cache disabled: each entry ~2 GiB × N variants would blow the
-      # 10 GiB repo cache and evict the kernel debs cache (30+ min rebuild).
-      # Rootfs from scratch is only ~10 min.
+      # Skip rootfs cache to preserve the 10 GiB cache for kernel debs.
 
-      # The armbian-build wrapper extensions/seeed-extension.sh hardcodes the
-      # UPSTREAM extension repo (Seeed-Studio/seeed_armbian_extension @ main),
-      # so every build would compile the upstream code and never the fixes on
-      # the dispatched ref of THIS repo. Make the repo overridable (the ref
-      # already is via SEEED_EXTENSION_REF) and point both at this checkout.
+      # Build this checkout, not the upstream extension's default branch.
       - name: Point seeed-extension at this checkout
         run: |
           cd armbian-build
@@ -478,13 +577,11 @@ jobs:
           DESKTOP_TIER: ${{ inputs.desktop_tier }}
         run: |
           set -euo pipefail
-          # Build the extension code from this workflow's repo + ref, not the
-          # upstream main the armbian-build wrapper pins by default.
+          # Pin the extension to this workflow's repository and commit.
           export SEEED_EXTENSION_REPO="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}.git"
           export SEEED_EXTENSION_REF="commit:${GITHUB_SHA}"
           echo "extension source: ${SEEED_EXTENSION_REPO} @ ${SEEED_EXTENSION_REF}"
-          # cli → --minimal (Debian 13); gnome → desktop (Ubuntu 26.04)
-          # sized by the desktop_tier choice.
+          # cli = minimal Debian 13; gnome = desktop Ubuntu 26.04.
           TIER_ARGS=""
           if [[ "$TIER" == "cli" ]]; then
               TIER_ARGS="--minimal"
@@ -492,7 +589,7 @@ jobs:
               TIER_ARGS="-d gnome -t $DESKTOP_TIER"
           fi
 
-          # Passphrase only when a security profile is set (preflight-validated).
+          # Encryption secrets are needed only for secure profiles.
           if [[ -n "$SECURITY" ]]; then
               export CRYPTROOT_PASSPHRASE="${{ secrets.CRYPTROOT_PASSPHRASE }}"
           fi
@@ -510,6 +607,7 @@ jobs:
             $TIER_ARGS
 
       - name: Compress .img to .img.xz + sha256
+        if: always()
         working-directory: armbian-build
         run: |
           set -euo pipefail
@@ -525,7 +623,72 @@ jobs:
           echo "=== output/images/ contents ==="
           ls -lh output/images/
 
+      - name: Setup rclone (seeed-storage OneDrive remote)
+        uses: ./.github/actions/setup-onedrive
+        with:
+          rclone_config: ${{ secrets.RCLONE_CONFIG }}
+
+      - name: Upload images to this tag's tree (OneDrive mode)
+        # Upload under trees/<tag>/<board>/<plain|secure>/<recovery|ab>/.
+        # Promote flips slots.json without moving trees.
+        working-directory: armbian-build
+        env:
+          PROFILE: ${{ matrix.profile || 'recovery' }}
+          SECURITY: ${{ matrix.security }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          files=(output/images/*.img.xz output/images/*.sha256 output/images/*.sha output/images/*.img.txt)
+          ota_files=(output/images/$BOARD/ota/*)
+          if [ ${#files[@]} -eq 0 ] || [ ${#ota_files[@]} -eq 0 ]; then
+            echo "::error::incomplete matrix output: ${#files[@]} image metadata file(s), ${#ota_files[@]} OTA file(s)"
+            exit 1
+          fi
+          if ! compgen -G 'output/images/*.img.xz' > /dev/null; then
+            echo "::error::no compressed .img.xz found; refusing an OTA-only partial leg"
+            exit 1
+          fi
+
+          sec_dir="plain"
+          [ -n "$SECURITY" ] && sec_dir="secure"
+          dest="seeed-storage:armbian/${GITHUB_REPOSITORY_OWNER,,}/images/trees/$TAG/$BOARD/$sec_dir/$PROFILE"
+          echo "Uploading to $dest"
+          rclone mkdir "$dest" 2>/dev/null || true
+          rclone copy output/images/ "$dest" \
+            --include "*.img.xz" --include "*.img.xz.sha256" --include "*.img.sha" --include "*.img.txt" \
+            --transfers 4 --stats-one-line --stats 30s
+          if [ ${#ota_files[@]} -gt 0 ]; then
+            rclone mkdir "$dest/ota" 2>/dev/null || true
+            rclone copy "output/images/$BOARD/ota/" "$dest/ota" \
+              --transfers 4 --stats-one-line --stats 30s
+          fi
+
+      - name: Upload production loaders to this tag's tree
+        # Loaders are board/security-scoped, so only cli/trixie/recovery uploads.
+        # Missing rkspi_loader.img is expected without BOOT_SUPPORT_SPI.
+        if: ${{ matrix.tier == 'cli' && matrix.release == 'trixie' && (matrix.profile || 'recovery') == 'recovery' }}
+        working-directory: armbian-build
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          dirs=(output/images/*/loaders/*)
+          if [ ${#dirs[@]} -eq 0 ]; then
+            echo "::error::no loaders found under output/images/<BOARD>/loaders/ — did pre_umount_final_image__902_export_production_loaders run?"
+            exit 1
+          fi
+          for d in "${dirs[@]}"; do
+            board="$(basename "$(dirname "$(dirname "$d")")")"
+            sec="$(basename "$d")"
+            dest="seeed-storage:armbian/${GITHUB_REPOSITORY_OWNER,,}/images/trees/$TAG/$board/$sec/loaders"
+            echo "Uploading loaders to $dest"
+            rclone mkdir "$dest" 2>/dev/null || true
+            rclone copy "$d/" "$dest" \
+              --include "*.xz" --include "*.xz.sha256" \
+              --transfers 4 --stats-one-line --stats 30s
+          done
+
       - name: Upload output/images/ as-is
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: Armbian-img-${{ matrix.board }}-${{ matrix.release }}-${{ matrix.tier }}-${{ matrix.profile || 'recovery' }}-${{ matrix.security || 'plain' }}-${{ github.run_id }}
@@ -535,7 +698,229 @@ jobs:
           compression-level: 0
 
       - name: Print ccache stats
+        if: always()
         run: |
           command -v ccache >/dev/null 2>&1 || { echo "ccache not installed on host; install with: sudo apt-get install -y ccache"; exit 0; }
           ccache -s 2>/dev/null || true
           du -sh armbian-build/cache/ccache 2>/dev/null || true
+
+  release:
+    needs: [plan, init-release, build]
+    # Publish share links and manifest, then point pre-release at this tag.
+    # Stable promotion is a separate workflow.
+    if: ${{ !cancelled() && needs.build.result == 'success' }}
+    runs-on: ubuntu-latest
+    # Allow time for per-file OneDrive link creation and retries.
+    timeout-minutes: 45
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ secrets.RELEASE_GH_TOKEN || github.token }}
+      TARGET_REPO: ${{ needs.plan.outputs.release_repo }}
+      TAG: ${{ needs.plan.outputs.tag }}
+      EXPECTED_MATRIX: ${{ needs.plan.outputs.matrix }}
+      BUILD_SOURCE_REPO: ${{ needs.plan.outputs.release_repo }}
+      EXTENSION_SHA: ${{ github.sha }}
+      BUILD_SOURCE_SHA: ${{ needs.plan.outputs.ab_commit }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup rclone (seeed-storage OneDrive remote)
+        uses: ./.github/actions/setup-onedrive
+        with:
+          rclone_config: ${{ secrets.RCLONE_CONFIG }}
+
+      - name: Link the tree, write manifest + slot pointer
+        # Write the manifest and candidate pointer before publishing.
+        # Re-read slots.json to reject concurrent edits.
+        run: |
+          set -euo pipefail
+          python3 <<'PY'
+          import json, os, random, subprocess, sys, time
+          from concurrent.futures import ThreadPoolExecutor
+          from datetime import datetime, timezone
+
+          tag = os.environ["TAG"]
+          IBASE = f"seeed-storage:armbian/{os.environ['GITHUB_REPOSITORY_OWNER'].lower()}/images"
+
+          def rclone_json(*args):
+              r = subprocess.run(["rclone", *args], capture_output=True, text=True)
+              if r.returncode != 0:
+                  print(f"::error::rclone {' '.join(args)}: {r.stderr.strip()}", file=sys.stderr)
+                  sys.exit(1)
+              try:
+                  return json.loads(r.stdout)
+              except json.JSONDecodeError as e:
+                  print(f"::error::rclone {' '.join(args)} returned invalid JSON: {e}", file=sys.stderr)
+                  sys.exit(1)
+
+          def rcat(path, content):
+              r = subprocess.run(["rclone", "rcat", path], input=content,
+                                 capture_output=True, text=True)
+              if r.returncode != 0:
+                  print(f"::error::rcat failed for {path}: {r.stderr.strip()}", file=sys.stderr)
+                  sys.exit(1)
+
+          # Map tree-relative file paths to links in one manifest.
+          # Exclude the manifest itself from this initial walk.
+          entries = rclone_json("lsjson", "-R", "--files-only", f"{IBASE}/trees/{tag}")
+          rel_files = [it["Path"] for it in entries if it["Path"] != "manifest.json"]
+          if not rel_files:
+              print(f"::error::trees/{tag} is empty — refusing to publish", file=sys.stderr)
+              sys.exit(1)
+
+          # Every planned leg needs an image and at least one OTA payload.
+          planned = json.loads(os.environ["EXPECTED_MATRIX"])["include"]
+          for leg in planned:
+              sec = "secure" if leg["security"] else "plain"
+              prefix = f"{leg['board']}/{sec}/{leg['profile']}/"
+              leg_files = [p for p in rel_files if p.startswith(prefix)]
+              if not any(p.endswith(".img.xz") for p in leg_files):
+                  print(f"::error::{prefix}: no .img.xz uploaded", file=sys.stderr)
+                  sys.exit(1)
+              if not any(p.startswith(prefix + "ota/") and not p.endswith(".checksums")
+                         for p in leg_files):
+                  print(f"::error::{prefix}ota/: no OTA payload uploaded", file=sys.stderr)
+                  sys.exit(1)
+          print(f"matrix coverage OK: {len(planned)} complete legs")
+
+          def make_link(rel):
+              dest = f"{IBASE}/trees/{tag}/{rel}"
+              for attempt in range(3):
+                  try:
+                      lr = subprocess.run(
+                          ["rclone", "link", dest, "--contimeout", "10s",
+                           "--timeout", "30s", "--low-level-retries", "2"],
+                          capture_output=True, text=True,
+                          # Bound the whole process, not only network I/O.
+                          timeout=90)
+                  except subprocess.TimeoutExpired:
+                      err = "rclone link exceeded its 90-second attempt limit"
+                  else:
+                      if lr.returncode == 0 and lr.stdout.strip():
+                          return rel, True, lr.stdout.strip()
+                      err = lr.stderr.strip() or "rclone link returned no URL"
+                  if attempt < 2:
+                      time.sleep(5 * 2 ** attempt + random.uniform(0, 3))
+              return rel, False, err
+
+          files_map, failures = {}, []
+          with ThreadPoolExecutor(max_workers=4) as ex:
+              for i, (rel, ok, res) in enumerate(ex.map(make_link, rel_files), 1):
+                  if ok:
+                      files_map[rel] = res
+                  else:
+                      failures.append(rel)
+                      print(f"::warning::link failed: {rel}: {res}", file=sys.stderr)
+                  if i % 25 == 0:
+                      print(f"  … {i}/{len(rel_files)} links", file=sys.stderr)
+          if failures:
+              print(f"::error::{len(failures)}/{len(rel_files)} share links failed — refusing to publish an incomplete manifest", file=sys.stderr)
+              sys.exit(1)
+          if set(files_map) != set(rel_files):
+              print("::error::manifest link coverage differs from the uploaded tree", file=sys.stderr)
+              sys.exit(1)
+
+          manifest = {
+              "tag": tag,
+              "created": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+              "source": {"repo": os.environ["BUILD_SOURCE_REPO"],
+                         "commit": os.environ["BUILD_SOURCE_SHA"]},
+              "extension": {"repo": os.environ["GITHUB_REPOSITORY"],
+                            "commit": os.environ["EXTENSION_SHA"]},
+              "files": files_map,
+          }
+          rcat(f"{IBASE}/trees/{tag}/manifest.json", json.dumps(manifest, indent=1, sort_keys=True))
+          print(f"manifest written into trees/{tag}/: {len(files_map)} links, {len(failures)} failures")
+
+          slots = rclone_json("cat", f"{IBASE}/slots.json", "--contimeout", "15s")
+          latest = rclone_json("cat", f"{IBASE}/slots.json", "--contimeout", "15s")
+          if latest != slots:
+              print("::error::slots.json changed between reads — refusing to overwrite a concurrent edit", file=sys.stderr)
+              sys.exit(1)
+          slots["pre-release"] = tag
+          rcat(f"{IBASE}/slots.json", json.dumps(slots, indent=1, sort_keys=True) + "\n")
+          print(f"slots.json: pre-release → {tag} (stable/previous untouched)")
+          PY
+
+      - name: Publish release
+        run: |
+          set -euo pipefail
+          # Publish only after the manifest and pointer are complete.
+          for attempt in 1 2 3 4 5; do
+            if gh release edit "$TAG" \
+              --repo "$TARGET_REPO" \
+              --draft=false \
+              --prerelease \
+              --latest=false; then
+              exit 0
+            fi
+            [ "$attempt" -lt 5 ] || { echo "::error::could not publish the complete candidate; it is retained for Images - Release"; exit 1; }
+            sleep $((attempt * 10))
+          done
+
+  # Render the page from the current mirror manifests.
+  pages:
+    name: Deploy images page (template sync)
+    needs: [plan, release]
+    if: ${{ !cancelled() && needs.release.result == 'success' }}
+    runs-on: ubuntu-latest
+    # PAGES_TARGET_TOKEN pushes gh-pages; GITHUB_TOKEN reads Releases.
+    permissions:
+      contents: read
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Deploy images page
+        uses: ./.github/actions/deploy-pages
+        with:
+          tag: ${{ needs.plan.outputs.tag }}
+          # Push the page to the build-source repo's gh-pages.
+          repo: ${{ needs.plan.outputs.release_repo }}
+          release_repo: ${{ needs.plan.outputs.release_repo }}
+          rclone_config: ${{ secrets.RCLONE_CONFIG }}
+          pages_token: ${{ secrets.PAGES_TARGET_TOKEN }}
+          gh_token: ${{ secrets.RELEASE_GH_TOKEN || github.token }}
+
+  cleanup:
+    name: Cleanup unfinished initialization
+    # Preserve initialized candidates for resumable failed-job reruns.
+    needs: [preflight, plan, init-release, build, release, pages]
+    if: ${{ always() && (cancelled() || failure()) && needs.init-release.result != 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ secrets.RELEASE_GH_TOKEN || github.token }}
+      TARGET_REPO: ${{ needs.plan.outputs.release_repo }}
+      TAG: ${{ needs.plan.outputs.tag }}
+    steps:
+      - name: Delete draft after unfinished initialization
+        # Delete only a confirmed owned draft after failed initialization.
+        run: |
+          set -euo pipefail
+          if [ -z "${TAG:-}" ]; then
+            echo "plan produced no tag — nothing was created; nothing to clean"
+            exit 0
+          fi
+          echo "::notice::initialization did not complete; preserving any mirror tree for repair"
+          if ! state="$(gh release view "$TAG" --repo "$TARGET_REPO" \
+            --json isDraft,isPrerelease,body --jq '[.isDraft,.isPrerelease,.body]|@json' 2>&1)"; then
+            grep -qi 'release not found' <<<"$state" \
+              && { echo "Release $TAG is absent; nothing to clean"; exit 0; }
+            echo "::error::cannot determine Release state; refusing cleanup: $state"
+            exit 1
+          fi
+          if [ "$(jq -r '.[0] and .[1]' <<<"$state")" != "true" ]; then
+            echo "::notice::$TAG is not a draft pre-release; preserving it"
+            exit 0
+          fi
+          jq -r '.[2]' <<<"$state" | grep -qE "${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}([/[:space:]]|$)" \
+            || { echo "::error::$TAG is not owned by run ${GITHUB_RUN_ID}; refusing cleanup"; exit 1; }
+          gh release delete "$TAG" --repo "$TARGET_REPO" --yes
+          gh api --method DELETE "repos/$TARGET_REPO/git/refs/tags/$TAG" >/dev/null 2>&1 || true
+          echo "deleted unfinished draft $TAG; mirror content was not touched"
