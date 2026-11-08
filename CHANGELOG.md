@@ -14,7 +14,8 @@ Covers the work against the initial import (merge base `9980aee`,
 
 #### Production loaders (maskrom / SPI flash)
 
-- **Board u-boot production artifacts exported with each image.** Every build now ships
+- **Board u-boot production artifacts exported to the OneDrive
+  `<board>/<plain|secure>/loaders/` tag tree.** Every build now ships
   `spl_loader_maskrom.bin` (maskrom flashing loader) in the u-boot deb for
   **every board** — the RK3576/RK3588 spl-blobs hooks append it to
   `target_files` gate-free, fixing industrial / module-devkit builds that
@@ -27,9 +28,27 @@ Covers the work against the initial import (merge base `9980aee`,
   both from the installed u-boot deb into
   `output/images/<board>/loaders/<plain|secure>/` (xz + `.sha256`); plain
   and secure never share a directory (secure legs rebuild both files
-  signed). CI uploads them from the reference leg (cli/trixie/recovery)
-  to `armbian/<owner>/images/trees/<tag>/<board>/<plain|secure>/loaders/`.
-  Promotion only flips the tag pointers; the loader files never move.
+  signed). CI mirrors the tree to the same tag tree's
+  `<board>/<plain|secure>/loaders/` directory
+  from the reference leg only (cli/trixie/recovery — the u-boot payload is
+  identical across tiers and OTA profiles of the same board+security, so
+  parallel legs would race identical paths with differently-timestamped
+  binaries). Promotion only changes tag pointers; loader files stay in
+  their immutable tree alongside the images.
+- **Images page: Loader boxes + security-group frames.** The download
+  page now renders each board's downloads as two security groups (green
+  PLAIN / red SECURE frames with solid inverted corner labels, replacing
+  the per-box Secure badge), each opening with a first-class **Loader**
+  mode box (chip icon; teal plain / orange secure buttons — a third color
+  tier so factory artifacts never read as OS images). Rows retitle
+  CLI→Minimal / keep Desktop, with terminal/monitor icons; all buttons
+  are equal-width pills and button groups never split mid-pair (a narrow
+  row wraps the whole group). Every board photo gains an "Armbian
+  Images" button (armbian-orange, embedded 32px logo data-URI, links to
+  the board's armbian.com page). Each tag's manifest includes the
+  `<board>/<plain|secure>/loaders/` files in the same LINKS map — Loader
+  boxes appear only when a slot actually holds them, and boards without a
+  SPI image simply show the Maskrom pair.
 
 #### Recovery OTA
 
@@ -203,16 +222,50 @@ Covers the work against the initial import (merge base `9980aee`,
 
 #### CI
 
-- **OneDrive mirror: tag-addressed images and static downloads.** Image,
-  OTA, and loader files live under
-  `armbian/<owner>/images/trees/<tag>/<board>/<plain|secure>/<kind>/`.
-  Per-file links are collected in each tree's `manifest.json`;
-  `slots.json` selects pre-release, stable, and bounded history. Promote
-  changes pointers without moving image files. Expired mirror trees may
-  be reclaimed, while GitHub Releases remain as version history. The
-  static download page reads one bundled `data.json` assembled from the
-  mirror manifests and Release metadata. OneDrive is required for binary
-  publication; GitHub Releases no longer carry image assets.
+- **OneDrive mirror: slot-first layout + per-slot tag files; no more
+  build-info.json.** The images tree is re-rooted from
+  `images/<board>/<slot>/…` to
+  `images/<slot>/<board>/<profile>[-secure-boot]/…` (slot ∈ pre-release /
+  latest / previous): rotation unit now equals release unit, promotion is
+  one server-side move per slot (every board flips together, no per-board
+  parallel rclone), and the staging purge at build start is a single
+  call. Each slot carries a `tag` file (the YYMMDD-HHMM build stamp)
+  written once every matrix entry has uploaded — it is the page's slot
+  binding (slot labels no longer inferred from release-list ordering) and
+  promote verifies it names the release being promoted before rotating.
+  The release carries no assets: the old `build-info.json` manifest is
+  gone (its identity role moved to `<slot>/tag`; releases without assets
+  are what promote's cleanup treats as superseded). The page walk lists
+  the whole `images/` tree in one `lsjson -R` (boards are discovered, no
+  board list input) and reads the three `tag` files; the release-list
+  inference stays as the fork-mode fallback (`SLOTS={}`).
+- **`apt-repo-publish.yml`: rk3576-module board, family-scoped kernel.**
+  New `build_rk3576_module` dispatch input extends the per-board matrix.
+  Kernel debs are family-scoped in Armbian (`linux-image`/`-headers`/
+  `-dtb` are per LINUXFAMILY and the DTB deb carries every family DTB),
+  so the first selected board of each family compiles the kernel once
+  and sibling boards build only their board-specific U-Boot — no
+  duplicate same-named kernel debs in the publish merge, no extra
+  kernel CI time per added board.
+- **`apt-repo-publish.yml`: rk3576-industrial board.** New
+  `build_rk3576_industrial` dispatch input (default on). Each matrix job
+  checks the board config exists in the selected `armbian_build_ref` and
+  skips gracefully with a notice when it does not — the board is not in
+  `Seeed-Studio/armbian-build` main yet, so default runs skip it until
+  the branch lands (meanwhile dispatch with
+  `armbian_build_ref=rk3576-industrial`).
+- **`apt-repo-publish.yml`: kernel compilation now opt-in.** New
+  `build_kernel` dispatch input (default false): the official Armbian
+  apt already hosts the `vendor-seeed-rk3576`/`rk3588` family kernels,
+  so the matrix builds U-Boot only by default; enable the input to
+  rebuild and publish family kernels (hotfix channel — the version
+  must outrank the official one to reach devices).
+- **`apt-repo-publish.yml`: kernel and U-Boot build in parallel.** The
+  board matrix carries a `target` dimension (`uboot` per selected board,
+  `kernel` per family when `build_kernel` is on), so each entry is an
+  independent job — a board's U-Boot no longer serializes behind its
+  kernel compile. Artifact names carry the target
+  (`debs-uboot-<board>`, `debs-kernel-<board>`).
 
 ### Changed
 

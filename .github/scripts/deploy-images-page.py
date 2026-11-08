@@ -1,0 +1,217 @@
+#!/usr/bin/env python3
+"""Validate the mirror manifest and assemble the images page data bundle."""
+
+import json
+import os
+import subprocess
+import sys
+import time
+
+from image_mirror_common import ImageMirrorError, decode, parse_slots
+
+DeployError = ImageMirrorError
+
+
+def rcat(path, retries=1):
+    result = None
+    for attempt in range(retries + 1):
+        try:
+            result = subprocess.run(
+                ["rclone", "cat", path, "--contimeout", "15s"],
+                capture_output=True, text=True, timeout=120,
+            )
+        except subprocess.TimeoutExpired:
+            result = None
+        else:
+            if result.returncode == 0:
+                return result.stdout
+        if attempt < retries:
+            time.sleep(5)
+    error = result.stderr.strip() if result is not None else "exceeded 120 seconds"
+    raise DeployError(f"rclone cat failed for {path}: {error}")
+
+
+def read_mirror(base):
+    slots_in = parse_slots(rcat(f"{base}/slots.json"), legacy=False)
+    stable, candidate, history = slots_in["stable"], slots_in["pre-release"], slots_in["history"]
+    if not any([stable, candidate, *history]):
+        missing = [key for key in ("stable", "pre-release") if key not in slots_in]
+        if "history" not in slots_in and "previous" not in slots_in:
+            missing.append("history")
+        if missing:
+            raise DeployError(
+                "empty slots.json lacks required pointer fields: "
+                + ", ".join(missing)
+            )
+        return {"slots": {}, "manifests": {}}
+
+    manifests, page_slots = {}, {}
+
+    def take(tag):
+        manifest = decode(
+            rcat(f"{base}/trees/{tag}/manifest.json"),
+            f"trees/{tag}/manifest.json",
+        )
+        if not isinstance(manifest, dict) or manifest.get("tag") != tag:
+            actual = manifest.get("tag") if isinstance(manifest, dict) else None
+            raise DeployError(
+                f"trees/{tag}/manifest.json is signed {actual!r} — mismatch"
+            )
+        files = manifest.get("files")
+        if not isinstance(files, dict) or not files:
+            raise DeployError(
+                f"trees/{tag}/manifest.json must have a non-empty files object"
+            )
+        if any(not isinstance(path, str) or not path or not isinstance(url, str) or not url
+               for path, url in files.items()):
+            raise DeployError(f"trees/{tag}/manifest.json has an invalid file link")
+        manifests[tag] = manifest
+
+    for slot, tag in (("pre-release", candidate), ("stable", stable)):
+        if tag:
+            take(tag)
+            page_slots[slot] = tag
+    seen = set()
+    for tag in history:
+        if tag in seen or tag in (stable, candidate):
+            raise DeployError(
+                f"slots.json history holds an invalid entry {tag!r} — "
+                "duplicate or primary-slot tag"
+            )
+        seen.add(tag)
+        take(tag)
+    if history:
+        page_slots["history"] = history
+    return {"slots": page_slots, "manifests": manifests}
+
+
+def gh(*args):
+    last_error = None
+    for attempt in range(3):
+        try:
+            result = subprocess.run(
+                ["gh", *args], capture_output=True, text=True, timeout=120,
+            )
+        except subprocess.TimeoutExpired:
+            last_error = "exceeded 120 seconds"
+        else:
+            if result.returncode == 0:
+                return result.stdout
+            last_error = result.stderr.strip() or "command failed"
+        if attempt < 2:
+            print(
+                f"gh {' '.join(args)} failed (attempt {attempt + 1}/3), "
+                f"retrying in {(attempt + 1) * 10}s", file=sys.stderr,
+            )
+            time.sleep((attempt + 1) * 10)
+    raise DeployError(f"gh {' '.join(args)} failed after 3 attempts: {last_error}")
+
+
+def release_metadata(release):
+    if not isinstance(release, dict):
+        raise DeployError("Release metadata must be a JSON object")
+    try:
+        tag = release["tag_name"]
+        prerelease = release["prerelease"]
+        published_at = release["published_at"]
+    except KeyError as exc:
+        raise DeployError(f"Release metadata lacks {exc.args[0]}") from exc
+    if not isinstance(tag, str) or not tag or not isinstance(prerelease, bool):
+        raise DeployError("Release metadata has an invalid tag or prerelease state")
+    if published_at is not None and not isinstance(published_at, str):
+        raise DeployError(f"Release {tag} has an invalid publication date")
+    return {"tag_name": tag, "prerelease": prerelease, "published_at": published_at}
+
+
+def read_releases(repo, referenced_tags):
+    # Do not rely on the newest N releases: an older stable/history tag must
+    # keep its real date and prerelease state on every refresh.
+    releases = {}
+    for tag in sorted(referenced_tags):
+        raw = gh(
+            "release", "view", tag, "--repo", repo,
+            "--json", "tagName,isPrerelease,publishedAt",
+        )
+        release = decode(raw, f"Release {tag}")
+        if not isinstance(release, dict) or release.get("tagName") != tag:
+            raise DeployError(f"Release lookup returned the wrong tag for {tag}")
+        releases[tag] = {
+            "tag_name": release["tagName"],
+            "prerelease": release["isPrerelease"],
+            "published_at": release["publishedAt"],
+        }
+
+    # The page consumes a complete array; preserve all Releases, including
+    # historical Releases whose mirror trees have exceeded retention.
+    raw = gh(
+        "api", "--paginate", f"repos/{repo}/releases?per_page=100",
+        "--jq", ".[] | {tag_name: .tag_name, prerelease: .prerelease, "
+                "published_at: .published_at}",
+    )
+    result = []
+    for line in raw.splitlines():
+        if not line.strip():
+            continue
+        release = decode(line, "Release list")
+        release = release_metadata(release)
+        if release["tag_name"] not in referenced_tags:
+            releases[release["tag_name"]] = release
+    for tag in referenced_tags:
+        if tag not in releases:
+            raise DeployError(f"referenced mirror tag lacks GitHub Release: {tag}")
+    result = [release_metadata(releases[tag]) for tag in sorted(releases)]
+    return result
+
+
+def assemble(repo, core, releases):
+    data = {
+        "repo": repo,
+        "slots": core["slots"],
+        "manifests": core["manifests"],
+        "releases": releases,
+    }
+    with open("data.json", "w") as stream:
+        json.dump(data, stream, separators=(",", ":"))
+    print(
+        f"data.json: repo={repo} slots={list(data['slots'])} "
+        f"{len(data['manifests'])} manifests, {len(releases)} releases"
+    )
+
+
+def main():
+    stage = sys.argv[1]
+    if stage == "manifest":
+        owner = os.environ["GITHUB_REPOSITORY_OWNER"].lower()
+        core = read_mirror(f"seeed-storage:armbian/{owner}/images")
+        with open("data-core.json", "w") as stream:
+            json.dump(core, stream)
+        count = sum(len(m.get("files") or {}) for m in core["manifests"].values())
+        print(
+            f"manifest: {len(core['slots'])} slot keys, "
+            f"{len(core['manifests'])} manifests, {count} links total",
+            file=sys.stderr,
+        )
+    elif stage == "data":
+        repo = os.environ["PAGE_REPO"]
+        if not repo:
+            raise DeployError("PAGE_REPO empty")
+        try:
+            with open("data-core.json") as stream:
+                core = json.load(stream)
+        except FileNotFoundError as exc:
+            raise DeployError(
+                "missing mirror data-core.json — refusing to deploy an empty page"
+            ) from exc
+        tags = {core["slots"].get("stable"), core["slots"].get("pre-release")}
+        tags.update(core["slots"].get("history", []))
+        assemble(repo, core, read_releases(repo, tags - {None}))
+    else:
+        raise DeployError(f"unknown stage: {stage}")
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except (DeployError, KeyError, ValueError, subprocess.TimeoutExpired) as exc:
+        print(f"::error::{exc}", file=sys.stderr)
+        sys.exit(1)
