@@ -406,20 +406,20 @@ function slotLoaders(slotDir) {
   const prefix = slotDir + "/";
   for (const path of Object.keys(LINKS)) {
     if (!path.startsWith(prefix)) continue;
-    const parts = path.split("/");   // [slot, board, sec, "loaders", file]
-    if (parts.length !== 5 || parts[3] !== "loaders") continue;
-    const file = parts[4];
+    const parts = path.slice(prefix.length).split("/"); // [board, sec, "loaders", file]
+    if (parts.length !== 4 || parts[2] !== "loaders") continue;
+    const file = parts[3];
     if (!file.endsWith(".xz")) continue; // .sha256 siblings resolved on demand
     const kind = file === "spl_loader_maskrom.bin.xz" ? "maskrom"
                : file === "rkspi_loader.img.xz" ? "spi" : null;
     if (!kind) continue;
     // Board keys must match parse()'s BOARD_PAT capture ("rk3576-devkit"),
     // not the manifest's full dir name ("recomputer-rk3576-devkit").
-    const board = parts[1].replace(/^recomputer-/, "");
+    const board = parts[0].replace(/^recomputer-/, "");
     const b = out.get(board) || {};
-    const s = b[parts[2]] || {};
+    const s = b[parts[1]] || {};
     s[kind] = path;
-    b[parts[2]] = s;
+    b[parts[1]] = s;
     out.set(board, b);
   }
   return out;
@@ -585,14 +585,14 @@ function slotAssets(slotDir) {
   return Object.keys(LINKS)
     .filter(path => {
       if (!path.startsWith(slotDir + "/")) return false;
-      const parts = path.split("/");          // [slot, board, sec, kind, ...]
-      return parts.length >= 5 && parts[3] !== "loaders";
+      const parts = path.slice(slotDir.length + 1).split("/"); // [board, sec, kind, ...]
+      return parts.length >= 4 && parts[2] !== "loaders";
     })
     .map(path => ({
       name: path.split("/").pop(),
       size: 0,
       browser_download_url: LINKS[path],
-      secure: path.split("/")[2] === "secure",
+      secure: path.slice(slotDir.length + 1).split("/")[1] === "secure",
       lk: path,
     }));
 }
