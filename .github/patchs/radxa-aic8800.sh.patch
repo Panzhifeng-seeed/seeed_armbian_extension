@@ -1,29 +1,79 @@
-diff --git a/extensions/radxa-aic8800.sh b/extensions/radxa-aic8800.sh
-index d8279cb55..2ea037f3a 100644
 --- a/extensions/radxa-aic8800.sh
 +++ b/extensions/radxa-aic8800.sh
-@@ -10,11 +10,72 @@ function extension_finish_config__install_kernel_headers_for_aic8800_dkms() {
+@@ -10,11 +10,96 @@ function extension_finish_config__install_kernel_headers_for_aic8800_dkms() {
  	display_alert "Forcing INSTALL_HEADERS=yes; for use with aic8800 dkms" "${EXTENSION}" "debug"
  }
  
++function aic8800_download_from_github_api() {
++	declare output_name="$1"
++	declare cached_file="${AIC8800_CACHE_DIR}/${output_name}"
++	declare assets_json="${AIC8800_CACHE_DIR}/release-${latest_version}.json"
++	declare release_encoded asset_id
++	declare -a curl_auth=()
++	if [[ -n "${AIC8800_GITHUB_TOKEN:-}" ]]; then
++		curl_auth=(--header "Authorization: Bearer ${AIC8800_GITHUB_TOKEN}")
++	fi
++
++	if [[ ! -f "${assets_json}" ]]; then
++		release_encoded=$(printf '%s' "${latest_version}" | jq -sRr @uri)
++		display_alert "Fetching AIC8800 release asset metadata" "${latest_version}" "info"
++		if ! curl --fail --location --silent --show-error --connect-timeout 15 --max-time 120 \
++			"${curl_auth[@]}" \
++			"https://api.github.com/repos/radxa-pkg/aic8800/releases/tags/${release_encoded}" \
++			--output "${assets_json}.tmp" \
++			|| ! jq -e '.assets | type == "array"' "${assets_json}.tmp" > /dev/null; then
++			rm -f "${assets_json}.tmp"
++			return 1
++		fi
++		mv -v "${assets_json}.tmp" "${assets_json}"
++	fi
++
++	if ! asset_id="$(jq -e -r --arg output_name "${output_name}" \
++		'.assets[] | select(.name == $output_name) | .id' "${assets_json}")"; then
++		display_alert "AIC8800 asset missing from GitHub release" "${output_name}" "warn"
++		return 1
++	fi
++	display_alert "Downloading AIC8800 package via GitHub asset API" "${output_name} (asset ${asset_id})" "info"
++	if ! curl --fail --location --silent --show-error --connect-timeout 15 --max-time 300 \
++		"${curl_auth[@]}" --header "Accept: application/octet-stream" \
++		"https://api.github.com/repos/radxa-pkg/aic8800/releases/assets/${asset_id}" \
++		--output "${cached_file}.tmp"; then
++		rm -f "${cached_file}.tmp"
++		return 1
++	fi
++	if ! dpkg-deb --info "${cached_file}.tmp" > /dev/null 2>&1; then
++		display_alert "Downloaded AIC8800 asset is not a valid deb" "${output_name}" "warn"
++		rm -f "${cached_file}.tmp"
++		return 1
++	fi
++	mv -v "${cached_file}.tmp" "${cached_file}"
++}
++
 +function aic8800_download_file_with_cache() {
 +	declare url="$1"
 +	declare output_name="$2"
 +	declare cached_file="${AIC8800_CACHE_DIR}/${output_name}"
 +
-+	if [[ -f "${cached_file}" ]]; then
-+		display_alert "Using cached AIC8800 package" "${output_name}" "debug"
-+	else
++	if [[ -f "${cached_file}" ]] && ! dpkg-deb --info "${cached_file}" > /dev/null 2>&1; then
++		display_alert "Discarding invalid cached AIC8800 package" "${output_name}" "warn"
++		rm -f "${cached_file}"
++	fi
++	if [[ ! -f "${cached_file}" ]]; then
 +		display_alert "Downloading AIC8800 package" "${output_name}" "info"
-+		if ! wget --progress=dot:mega --local-encoding=UTF-8 --output-document="${cached_file}.tmp" "${url}"; then
-+			rm -f "${cached_file}.tmp"
-+			if [[ -f "${cached_file}" ]]; then
-+				display_alert "Download failed, using cached AIC8800 package" "${output_name}" "warn"
-+			else
-+				exit_with_error "Failed to download ${url} and no cached file exists."
-+			fi
-+		else
++		if wget --progress=dot:mega --local-encoding=UTF-8 --tries=3 --timeout=30 --waitretry=2 \
++			--output-document="${cached_file}.tmp" "${url}" \
++			&& dpkg-deb --info "${cached_file}.tmp" > /dev/null 2>&1; then
 +			mv -v "${cached_file}.tmp" "${cached_file}"
++		else
++			rm -f "${cached_file}.tmp"
++			display_alert "Release download failed, trying the GitHub asset API" "${output_name}" "warn"
++		fi
++	fi
++	if [[ ! -f "${cached_file}" ]]; then
++		if ! aic8800_download_from_github_api "${output_name}"; then
++			rm -f "${cached_file}.tmp"
++			display_alert "Failed to download AIC8800 package from GitHub" "${output_name}" "err"
++			return 1
 +		fi
 +	fi
 +
@@ -39,44 +89,16 @@ index d8279cb55..2ea037f3a 100644
 +
 +	# Cache dir on host. Reused across builds.
 +	declare -g AIC8800_CACHE_DIR="${AIC8800_CACHE_DIR:-${SRC}/cache/radxa-aic8800-debs}"
-+	declare aic8800_version_cache_file="${AIC8800_CACHE_DIR}/version.cache"
 +	mkdir -p "${AIC8800_CACHE_DIR}"
 +
-+	# Fallback version when the GitHub API is unreachable and no cache exists.
-+	declare AIC8800_FALLBACK_VERSION="${AIC8800_FALLBACK_VERSION:-5.0+git20260123.5f7be68d-8}"
-+
-+	# Allow pinning the AIC8800 release version. This avoids the GitHub API
-+	# entirely and lets you mirror the .deb files on your own server.
-+	# Example: AIC8800_VERSION="5.0+git20260123.5f7be68d-8" AIC8800_BASE_URL="https://your-mirror.example/aic8800"
-+	if [[ -n "${AIC8800_VERSION:-}" ]]; then
-+		latest_version="${AIC8800_VERSION}"
-+		display_alert "AIC8800 version pinned" "${latest_version}" "info"
-+	else
-+		if latest_version="$(github_latest_release_tag "radxa-pkg/aic8800")"; then
-+			{
-+				echo "VERSION=${latest_version}"
-+				echo "CACHED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-+			} > "${aic8800_version_cache_file}"
-+			display_alert "Cached AIC8800 latest version" "${latest_version}" "debug"
-+		else
-+			if [[ -f "${aic8800_version_cache_file}" ]]; then
-+				latest_version=$(grep -E '^VERSION=' "${aic8800_version_cache_file}" | cut -d= -f2- | tail -1)
-+				declare cached_at
-+				cached_at=$(grep -E '^CACHED_AT=' "${aic8800_version_cache_file}" | cut -d= -f2- | tail -1)
-+				if [[ -z "${latest_version}" ]]; then
-+					exit_with_error "Failed to determine AIC8800 latest version from GitHub API and cached version is empty. Pin it with AIC8800_VERSION or check network/proxy."
-+				fi
-+				display_alert "GitHub API failed, using cached AIC8800 version" "${latest_version} (cached at ${cached_at:-unknown})" "warn"
-+			else
-+				latest_version="${AIC8800_FALLBACK_VERSION}"
-+				display_alert "GitHub API failed, no cache exists, using fallback AIC8800 version" "${latest_version}" "warn"
-+			fi
-+		fi
-+	fi
++	# Pin a known-good release. The asset API is used if release downloads fail.
++	declare AIC8800_FALLBACK_VERSION="${AIC8800_FALLBACK_VERSION:-5.0+git20260123.5f7be68d-10}"
++	latest_version="${AIC8800_VERSION:-${AIC8800_FALLBACK_VERSION}}"
++	display_alert "AIC8800 version pinned" "${latest_version}" "info"
  
  	# Determine the DKMS package name based on the requested AIC8800_TYPE.
  	declare aic8800_dkms_file_name
-@@ -31,24 +92,21 @@ function post_install_kernel_debs__install_aic8800_dkms_package() {
+@@ -31,24 +116,20 @@ function post_install_kernel_debs__install_aic8800_dkms_package() {
  	if [[ "${GITHUB_MIRROR}" == "ghproxy" ]]; then
  		ghproxy_header="https://ghfast.top/"
  	fi
@@ -107,7 +129,6 @@ index d8279cb55..2ea037f3a 100644
 -		fi
 -		cp -v "${full_deb_path}" "${SDCARD}/tmp/${deb_file}"
 -	done
-+	declare down_url
 +	aic8800_download_file_with_cache "${ghproxy_header}${base_url}/${aic8800_dkms_file_name}" "${aic8800_dkms_file_name}"
 +	aic8800_download_file_with_cache "${ghproxy_header}${base_url}/${aic8800_firmware_file_name}" "${aic8800_firmware_file_name}"
  

@@ -491,8 +491,8 @@ jobs:
           echo "=== env forwarding in docker.sh ==="
           grep -nE 'CRYPTROOT_PASSPHRASE|SEEED_EXTENSION_(REPO|REF)' lib/functions/host/docker.sh
 
-      - name: Patch radxa-aic8800 extension against GitHub API flakiness
-        # Pin AIC8800 and cache downloads to tolerate API failures.
+      - name: Patch radxa-aic8800 extension against GitHub flakiness
+        # Pin AIC8800, cache downloads, and fall back to the asset API.
         run: |
           cd armbian-build
           git apply "${GITHUB_WORKSPACE}/.github/patchs/radxa-aic8800.sh.patch"
@@ -553,6 +553,12 @@ jobs:
           restore-keys: |
             ccache-arm64-${{ matrix.board }}-vendor-
             ccache-arm64-${{ matrix.board }}-
+
+      - name: Restore AIC8800 download cache
+        uses: actions/cache@v4
+        with:
+          path: armbian-build/cache/radxa-aic8800-debs
+          key: aic8800-v10
 
       # Skip rootfs cache to preserve the 10 GiB cache for kernel debs.
 
