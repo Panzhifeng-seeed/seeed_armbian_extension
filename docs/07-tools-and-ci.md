@@ -57,23 +57,21 @@ ARMBIAN_APT_GPG_KEY_ID=<gpg-key-id> ./.github/scripts/publish-aptly.sh out/debs
 ```
 
 `APT - Build & Publish` deploys the resulting repository to the current
-pipeline owner's **root Pages** at `https://<owner>.github.io/`, not the
-extension repository's project Pages. The APT source is therefore:
+extension repository's **project Pages** at
+`https://<owner>.github.io/seeed_armbian_extension/`. This is independent of
+the Images page in `armbian-build`. The APT source is therefore:
 
 ```bash
-curl -fsSL https://<owner>.github.io/seeed-repo.gpg \
+curl -fsSL https://<owner>.github.io/seeed_armbian_extension/seeed-repo.gpg \
   | sudo gpg --dearmor -o /usr/share/keyrings/seeed-repo.gpg
-echo "deb [signed-by=/usr/share/keyrings/seeed-repo.gpg] https://<owner>.github.io/ stable main" \
+echo "deb [signed-by=/usr/share/keyrings/seeed-repo.gpg] https://<owner>.github.io/seeed_armbian_extension/ stable main" \
   | sudo tee /etc/apt/sources.list.d/seeed.list
 ```
 
-Before the first dispatch, create the `<owner>/<owner>.github.io` repository
-and select **Deploy from a branch → `gh-pages` / `/ (root)`** in its Pages
-settings. Set `PAGES_TARGET_TOKEN` on the extension repository to a PAT that
-can write that repository's contents and trigger its Pages builds. Deployment
-replaces only the APT-managed `index.html`, GPG key, `dists/` and `pool/`;
-unrelated content elsewhere on the Owner Pages is preserved. A publish does
-not create the target repository or change its Pages settings.
+Before the first dispatch, select **GitHub Actions** as the Pages source in
+the extension repository's settings. The `github-pages` environment must allow
+the branch used to dispatch the workflow. Native GitHub Pages deployment uses
+the workflow token; no Images Pages repository or deployment PAT is involved.
 
 ## 3. CI builds (Images Build workflow)
 

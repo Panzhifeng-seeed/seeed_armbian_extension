@@ -37,6 +37,11 @@ on:
         type: boolean
         default: false
 
+# Keep an older APT deployment from replacing a newer project Pages site.
+concurrency:
+  group: apt-pages-${{ github.repository_owner }}
+  cancel-in-progress: false
+
 # ──────────────────────────────────────────────────
 # Single workflow: userspace debs (ARM) and kernel +
 # U-Boot debs (x86 cross-compile) build in parallel,
@@ -414,9 +419,7 @@ jobs:
     needs: [build-userspace, build-kernel-uboot, build-camera-engine]
     runs-on: ubuntu-latest
     permissions:
-      contents: write
-      pages: write
-      id-token: write
+      contents: read
 
     steps:
       - name: Checkout (for scripts)
@@ -542,12 +545,12 @@ jobs:
         env:
           ARMBIAN_APT_GPG_KEY_ID: ${{ secrets.ARMBIAN_APT_GPG_KEY_ID }}
         run: |
-          chmod +x scripts/*.sh
-          scripts/publish-aptly.sh /tmp/debs
+          chmod +x scripts/*.sh .github/scripts/*.sh
+          .github/scripts/publish-aptly.sh /tmp/debs
 
       - name: Generate deb index page
         run: |
-          scripts/generate-deb-index.sh /tmp/debs public/index.html /tmp/sdk-debs.manifest
+          .github/scripts/generate-deb-index.sh /tmp/debs public/index.html /tmp/sdk-debs.manifest
 
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v4
@@ -555,19 +558,21 @@ jobs:
           path: public
 
   # ──────────────────────────────────────────────────
-  # Deploy to GitHub Pages
+  # Deploy APT to this repository's project Pages. Images publishing is a
+  # separate pipeline in armbian-build and must not share this destination.
   # ──────────────────────────────────────────────────
   deploy-pages:
     needs: publish
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     permissions:
       pages: write
       id-token: write
     environment:
       name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
+      url: https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}/
 
     steps:
-      - name: Deploy to GitHub Pages
+      - name: Deploy to project GitHub Pages
         id: deployment
         uses: actions/deploy-pages@v4
