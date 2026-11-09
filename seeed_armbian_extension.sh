@@ -132,14 +132,12 @@ function post_customize_image__010_disable_pcie_aspm() {
 # (matches BUILD_REPOSITORY_COMMIT there). Falls back to the checkout when
 # the wrapper did not run.
 function post_family_tweaks__999_seeed_extension_release_info() {
-	declare ref="${SEEED_EXTENSION_REF:-unknown}"
 	declare commit="${SEEED_EXTENSION_COMMIT:-}"
 	if [[ -z "${commit}" && -d "${SRC}/cache/sources/seeed_armbian_extension/.git" ]]; then
 		commit="$(git -C "${SRC}/cache/sources/seeed_armbian_extension" rev-parse HEAD 2>/dev/null || true)"
 	fi
 	if [[ -f "${SDCARD}/etc/armbian-release" ]]; then
 		cat <<- EOF >> "${SDCARD}"/etc/armbian-release
-			SEEED_EXTENSION_REF=${ref}
 			SEEED_EXTENSION_COMMIT=${commit:-unknown}
 		EOF
 	else
