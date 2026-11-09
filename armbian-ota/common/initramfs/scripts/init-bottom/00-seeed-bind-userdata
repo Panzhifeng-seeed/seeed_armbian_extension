@@ -45,18 +45,42 @@ LINK=/dev/armbian-userdata
 log() { echo "[seeed-bind-userdata] $*"; }
 warn() { echo "[seeed-bind-userdata] WARN: $*" >&2; }
 
+# Map a GPT partition label to the boot partition label serving the same
+# slot: A/B layouts pair rootfs_a/rootfs_b with boot_a/boot_b, single-slot
+# layouts use rootfs/boot. Unknown labels (e.g. a userdata backing partition
+# handed in by the encrypted path) map to nothing.
+map_boot_partlabel() {
+    case "$1" in
+        rootfs_a|boot_a) echo "boot_a" ;;
+        rootfs_b|boot_b) echo "boot_b" ;;
+        rootfs|boot) echo "boot" ;;
+        *) echo "" ;;
+    esac
+}
+
 # Record the same-disk ext4 boot partition for zz-seeed-mount-boot, which
 # mounts /boot after overlayroot assembled the overlay. The anchor is passed
 # through /run (tmpfs, shared by every initramfs stage). fstab must NOT
 # reference this mount: UUID sources flip between dd-cloned disks through
 # udev's duplicate-UUID symlinks, and hand-made /dev symlinks never satisfy
-# systemd's udev-backed device unit. Raw-FIT (secure boot) layouts carry no
-# ext4 boot partition, so a missing or non-ext4 candidate records nothing.
+# systemd's udev-backed device unit. A/B disks carry two boot partitions, so
+# the running slot's boot_a/boot_b is derived from the anchor's own PARTLABEL
+# (rootfs_a -> boot_a); the single-slot PARTLABEL=boot lookup stays as
+# fallback. Raw-FIT (secure boot) layouts carry no ext4 boot partition, so a
+# missing or non-ext4 candidate records nothing.
 record_boot_anchor() {
     anchor_root="$1"
     [ -n "${anchor_root}" ] || return 0
 
-    boot_part="$(find_user_data__partlabel_on_root_disk "${anchor_root}" boot 2>/dev/null || true)"
+    boot_part=""
+    anchor_partlabel="$(blkid -s PARTLABEL -o value "${anchor_root}" 2>/dev/null | head -n1)"
+    slot_boot_label="$(map_boot_partlabel "${anchor_partlabel}")"
+    if [ -n "${slot_boot_label}" ]; then
+        boot_part="$(find_user_data__partlabel_on_root_disk "${anchor_root}" "${slot_boot_label}" 2>/dev/null || true)"
+    fi
+    if [ -z "${boot_part}" ]; then
+        boot_part="$(find_user_data__partlabel_on_root_disk "${anchor_root}" boot 2>/dev/null || true)"
+    fi
     if [ -n "${boot_part}" ] && [ "$(blkid -s TYPE -o value "${boot_part}" 2>/dev/null)" = "ext4" ]; then
         mkdir -p /run 2>/dev/null || true
         printf '%s\n' "${boot_part}" > /run/armbian-boot-part
