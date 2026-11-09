@@ -273,6 +273,15 @@ Covers the work against the initial import (merge base `9980aee`,
   udev-backed device units):
   - A/B boot and rootfs selection anchored to U-Boot's actual boot disk;
     userdata anchored to the boot disk across initramfs and runtime.
+  - A/B `/boot` mount anchored too: `zz-seeed-mount-boot` now ships in A/B
+    images and the `/boot` fstab entry is dropped at build time, so an A/B
+    image dd-cloned onto eMMC and NVMe no longer mounts `/boot` from
+    whichever disk enumerated first (observed: `/boot` from eMMC
+    `mmcblk0p1` while kernel and root overlay came from NVMe). The initramfs
+    boot anchor resolves the running slot's `boot_a`/`boot_b` from the root
+    partition's `PARTLABEL` (`rootfs_a` -> `boot_a`); the single-slot
+    `PARTLABEL=boot` lookup stays as fallback, so recovery images and
+    encrypted layouts keep the original anchor behaviour unchanged.
   - Recovery userdata lookup anchored to the rootfs disk; recovery
     initramfs writes and security-partition key lookup anchored to the boot
     disk; the device-encryption probe anchored likewise, and the recovery
