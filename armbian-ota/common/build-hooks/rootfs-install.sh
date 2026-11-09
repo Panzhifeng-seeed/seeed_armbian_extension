@@ -19,4 +19,5 @@ function ota_sync_rootfs() {
 
 function ota_install_common_runtime_to_rootfs() {
     ota_sync_rootfs "OTA runtime" "${OTA_COMMON_ROOTFS}" "$1"
+    printf 'IMAGE_VARIANT=%s\n' "${OTA_IMAGE_VARIANT}" > "$1/etc/armbian-ota-image"
 }

@@ -20,6 +20,12 @@ function ota_secure_boot_encrypted_rootfs_enabled() {
 }
 
 if [[ "${OTA_ENABLE:-}" == "yes" ]]; then
+    if [[ "${BUILD_DESKTOP:-no}" == "yes" ]]; then
+        OTA_IMAGE_VARIANT="desktop"
+    else
+        OTA_IMAGE_VARIANT="cli"
+    fi
+
     for ota_support_module in \
         common/build-hooks/image-naming \
         common/build-hooks/partitions \

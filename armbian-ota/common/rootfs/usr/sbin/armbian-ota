@@ -79,6 +79,7 @@ check_ota_pkg() {
         error_exit "OTA package encryption mismatch: package=${package_encrypted}, device=${device_encrypted}"
 
     ota_check_board_release
+    ota_check_image_variant
 }
 
 call_mode_action() {

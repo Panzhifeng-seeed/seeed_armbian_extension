@@ -132,6 +132,19 @@ ota_check_board_release() {
     fi
 }
 
+ota_check_image_variant() {
+    local package_variant system_variant
+
+    package_variant="$(package_env_get_value "IMAGE_VARIANT" || true)"
+    system_variant="$(sed -n 's/^IMAGE_VARIANT=//p' /etc/armbian-ota-image 2>/dev/null | head -n1)"
+    if [ -z "${package_variant}" ] || [ -z "${system_variant}" ]; then
+        log_warn "IMAGE_VARIANT missing (package=${package_variant:-unknown}, device=${system_variant:-unknown}); skipping legacy variant gate"
+        return 0
+    fi
+    [ "${package_variant}" = "${system_variant}" ] ||
+        error_exit "OTA package IMAGE_VARIANT mismatch: package=${package_variant}, device=${system_variant}; CLI and Desktop images cannot cross-upgrade"
+}
+
 # KIND=full implies BOTH the rootfs archive and a boot payload exist and are
 # covered by their checksum files. This is an explicit assertion, not a side
 # effect of checksum verification: a broken build can drop the boot member
