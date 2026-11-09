@@ -115,7 +115,11 @@ Promotion validates the complete referenced trees, updates the pointers
 moves no image files. The OneDrive tree for an expired stable may be
 purged, but its GitHub Release is retained as historical metadata.
 `Pages - Refresh` (`refresh-pages.yml`) re-renders the page from the live
-manifest state, for example after manual OneDrive cleanup.
+manifest state, for example after manual OneDrive cleanup. A missing or
+unreadable history manifest is treated as expired and omitted from downloads;
+its GitHub Release remains listed. Missing stable/pre-release trees and unreadable or invalid
+manifests still abort deployment. `Images - Release` also removes dangling
+history pointers during reconciliation.
 
 Board u-boot **production loaders** live inside the same tag tree, at
 `<board>/<plain|secure>/loaders/`.

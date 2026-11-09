@@ -31,6 +31,33 @@ def rcat(path, retries=1):
     raise DeployError(f"rclone cat failed for {path}: {error}")
 
 
+def tree_dirs(base):
+    result = None
+    for attempt in range(2):
+        try:
+            result = subprocess.run(
+                ["rclone", "lsjson", "--dirs-only", f"{base}/trees",
+                 "--contimeout", "15s"],
+                capture_output=True, text=True, timeout=120,
+            )
+        except subprocess.TimeoutExpired:
+            result = None
+        else:
+            if result.returncode == 0:
+                listing = decode(result.stdout, "trees/")
+                if (not isinstance(listing, list)
+                        or any(not isinstance(entry, dict)
+                               or not isinstance(entry.get("Path"), str)
+                               or not entry["Path"] or "/" in entry["Path"]
+                               for entry in listing)):
+                    raise DeployError("trees/: invalid directory listing")
+                return {entry["Path"] for entry in listing}
+        if attempt == 0:
+            time.sleep(5)
+    error = result.stderr.strip() if result is not None else "exceeded 120 seconds"
+    raise DeployError(f"rclone lsjson failed for {base}/trees: {error}")
+
+
 def read_mirror(base):
     slots_in = parse_slots(rcat(f"{base}/slots.json"), legacy=False)
     stable, candidate, history = slots_in["stable"], slots_in["pre-release"], slots_in["history"]
@@ -47,11 +74,22 @@ def read_mirror(base):
 
     manifests, page_slots = {}, {}
 
-    def take(tag):
-        manifest = decode(
-            rcat(f"{base}/trees/{tag}/manifest.json"),
-            f"trees/{tag}/manifest.json",
-        )
+    def take(tag, optional=False):
+        try:
+            manifest = decode(
+                rcat(f"{base}/trees/{tag}/manifest.json"),
+                f"trees/{tag}/manifest.json",
+            )
+        except DeployError as exc:
+            if not optional:
+                raise
+            # An expired history tree can leave a file-shaped parent entry;
+            # rclone lsjson may list it even though no manifest is readable.
+            print(
+                f"::warning::history manifest {tag} is unreadable; "
+                f"omitting its downloads: {exc}", file=sys.stderr,
+            )
+            return False
         if not isinstance(manifest, dict) or manifest.get("tag") != tag:
             actual = manifest.get("tag") if isinstance(manifest, dict) else None
             raise DeployError(
@@ -66,22 +104,37 @@ def read_mirror(base):
                for path, url in files.items()):
             raise DeployError(f"trees/{tag}/manifest.json has an invalid file link")
         manifests[tag] = manifest
+        return True
 
     for slot, tag in (("pre-release", candidate), ("stable", stable)):
         if tag:
             take(tag)
             page_slots[slot] = tag
     seen = set()
-    for tag in history:
-        if tag in seen or tag in (stable, candidate):
-            raise DeployError(
-                f"slots.json history holds an invalid entry {tag!r} — "
-                "duplicate or primary-slot tag"
-            )
-        seen.add(tag)
-        take(tag)
+    present_history = []
+    # A history tree may have been deleted out of band or after retention.
+    # Enumerate its parent instead of guessing from a backend error message.
+    # Primary slots remain mandatory: never drop their links on a refresh.
     if history:
-        page_slots["history"] = history
+        present_trees = tree_dirs(base)
+        for tag in history:
+            if tag in seen or tag in (stable, candidate):
+                raise DeployError(
+                    f"slots.json history holds an invalid entry {tag!r} — "
+                    "duplicate or primary-slot tag"
+                )
+            seen.add(tag)
+            if tag not in present_trees:
+                print(
+                    f"::warning::history tree {tag} is absent; "
+                    "omitting it from downloads while retaining its Release",
+                    file=sys.stderr,
+                )
+                continue
+            if take(tag, optional=True):
+                present_history.append(tag)
+    if present_history:
+        page_slots["history"] = present_history
     return {"slots": page_slots, "manifests": manifests}
 
 

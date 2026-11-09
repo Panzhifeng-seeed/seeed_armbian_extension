@@ -65,10 +65,10 @@ runs:
       # This step validates (signed manifests, non-empty images, sane
       # history) and writes data-core.json; the render step merges in
       # the release list and emits the single data.json the page
-      # fetches. A manifest that won't fetch after one retry is a hard
-      # error — deploying anyway would strip that slot's links off a
-      # good page (same stance as the old "no share links at all"
-      # refusal).
+      # fetches. Absent or unreadable history trees/manifests are expired
+      # downloads and are omitted; primary slots and invalid manifests
+      # remain hard errors — deploying those anyway would strip good links
+      # off a good page.
       if: steps.gate.outputs.skip != 'true'
       shell: bash
       run: python3 .github/scripts/deploy-images-page.py manifest

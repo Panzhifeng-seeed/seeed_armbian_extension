@@ -412,6 +412,11 @@ Covers the work against the initial import (merge base `9980aee`,
 
 ### Fixed
 
+- **Refresh after manual history-tree deletion.** The images page now omits
+  expired history downloads when their OneDrive manifest is absent or
+  unreadable, while keeping the GitHub Release metadata. Stable/pre-release manifests still require a
+  successful read. Reconciliation also clears dangling history pointers.
+
 - **A/B payload extraction died on compressed tarballs (`tar: Archive is
   compressed. Use -J option`).** `ab_extract_tar_payload` piped the raw
   payload through `pv` straight into `tar -xf -`; GNU tar only auto-detects

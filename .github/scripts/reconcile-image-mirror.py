@@ -311,8 +311,10 @@ def reconcile(mirror, releases, depth=1):
     # Check tree existence before discarding a missing candidate pointer;
     # treeless candidates need remove_dangling's ownership checks below.
     repaired = None
-    candidate_tree_missing = bool(
-        candidate and candidate not in mirror.dirs("trees")
+    tree_dirs = mirror.dirs("trees")
+    candidate_tree_missing = bool(candidate and candidate not in tree_dirs)
+    missing_history = sorted(
+        tag for tag in old["history"] if tag not in tree_dirs
     )
     # Repair a deleted Release before rotating the candidate to stable;
     # otherwise an old stable is pushed into history while losing its tag.
@@ -347,9 +349,12 @@ def reconcile(mirror, releases, depth=1):
         mode = "reconcile"
     promoted = candidate if mode == "promote" else None
     stable = promoted or stable
+    if missing_history:
+        print(f"clearing pointers to missing history trees: {', '.join(missing_history)}")
     history = [old["stable"], *old["history"]] if promoted else old["history"]
     history = list(dict.fromkeys(
-        tag for tag in history if tag and tag != stable
+        tag for tag in history
+        if tag and tag != stable and tag not in missing_history
     ))[:depth]
     desired = {
         "stable": stable,
