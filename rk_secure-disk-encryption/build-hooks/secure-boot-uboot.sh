@@ -52,24 +52,96 @@ function resolve_platform_bl32_blob() {
     esac
 }
 
+function resolve_platform_bl32_blob_v5() {
+    # vendor-next consumes the official rockchip-linux/rkbin master (bin/ layout,
+    # newest-only blobs, fetched by the family conf into RKBIN_DIR); the
+    # armbian-mirror blobs above no longer exist there. Versions follow the
+    # official RKTRUST ini pairing with the bl31 blobs pinned by the family conf
+    # (rk3576: bl31 v1.25 <-> bl32 v1.12; rk3588: bl31 v1.56 <-> bl32 v1.23).
+    local platform="$1"
+
+    case "${platform}" in
+        rk3576) echo "bin/rk35/rk3576_bl32_v1.12.bin" ;;
+        rk3588) echo "bin/rk35/rk3588_bl32_v1.23.bin" ;;
+        *) echo "" ;;
+    esac
+}
+
+function rk_secure_boot_stage_bl32_binman() {
+    # Binman packs the TEE through the @tee-SEQ split-elf template, which only
+    # accepts ELF images or OP-TEE v1 binaries. The Rockchip bl32 blobs are raw
+    # AArch64 images with no header, so prepend a synthetic OP-TEE v1 header:
+    # binman derives load/entry (0x48400000) from it and drops the header when
+    # emitting the tee-1 node, so SPL copies exactly the raw blob to the load
+    # address — the same memory image the vendor fit generator flow produces.
+    # TEE_OFFSET matches the vendor fit_args.sh default (0x08400000) on top of
+    # the 0x40000000 DRAM base.
+    local blob_path="$1"
+    local tee_bin="$2"
+    local load_addr=$((0x40000000 + 0x08400000))
+    local blob_size
+
+    blob_size="$(stat -c %s "${blob_path}")" ||
+        exit_with_error "BL32 blob unreadable" "${blob_path}"
+
+    # NOTE: the python script must be guarded with `if ! cmd <<'PY' ... PY
+    # then ... fi`. A `cmd <<'PY' || fallback` form is parsed differently: the
+    # heredoc body starts on the line AFTER the marker (swallowing the `||`
+    # continuation line as its first script line) and the `||` binds to the
+    # command after the terminator — the fallback never runs on failure.
+    if ! python3 - "${blob_path}" "${tee_bin}" "${load_addr}" "${blob_size}" <<'PY'
+import struct
+import sys
+
+blob_path, tee_bin, load_addr, blob_size = (
+    sys.argv[1], sys.argv[2], int(sys.argv[3]), int(sys.argv[4]))
+with open(blob_path, "rb") as blob:
+    payload = blob.read()
+if len(payload) != blob_size:
+    raise SystemExit(f"BL32 blob size changed during staging: {len(payload)} != {blob_size}")
+# Magic "OPTE\x01" + 3 pad bytes, then init_size, start_hi, start_lo, reserved,
+# paged_size -- the layout binman's Entry_tee_os.read_elf_segments() parses.
+header = b"OPTE\x01" + bytes(3) + struct.pack("<5I", blob_size, 0, load_addr, 0, 0)
+with open(tee_bin, "wb") as out:
+    out.write(header + payload)
+PY
+    then
+        exit_with_error "Failed to wrap BL32 as an OP-TEE v1 binary" "${tee_bin}"
+    fi
+    display_alert "secure-uboot" "Staged BL32 for binman (OP-TEE v1 wrapped, load=0x$(printf '%x' "${load_addr}")): ${blob_path} -> tee.bin" "info"
+}
+
 function rk_secure_boot_prepare_tee_bin() {
     local uboot_workdir="$1"
     local platform bl32_blob bl32_path
 
     platform="$(rk_detect_platform)"
-    bl32_blob="$(resolve_platform_bl32_blob "${platform}")"
+
+    if [[ "${BRANCH:-}" == "vendor-next" ]]; then
+        bl32_blob="$(resolve_platform_bl32_blob_v5 "${platform}")"
+    else
+        bl32_blob="$(resolve_platform_bl32_blob "${platform}")"
+    fi
     if [[ -z "${bl32_blob}" ]]; then
         exit_with_error "No BL32 blob mapping found" "BOOT_SOC=${BOOT_SOC:-} BOARD=${BOARD:-}"
     fi
 
-    bl32_path="${SRC}/cache/sources/rkbin-tools/${bl32_blob}"
-    if [[ ! -f "${bl32_path}" ]]; then
-        exit_with_error "BL32 blob missing" "${bl32_path}"
-    fi
+    if [[ "${BRANCH:-}" == "vendor-next" ]]; then
+        bl32_path="${RKBIN_DIR}/${bl32_blob}"
+        if [[ ! -f "${bl32_path}" ]]; then
+            exit_with_error "BL32 blob missing" "${bl32_path}"
+        fi
+        rk_secure_boot_stage_bl32_binman "${bl32_path}" "${uboot_workdir}/tee.bin"
+    else
+        bl32_path="${SRC}/cache/sources/rkbin-tools/${bl32_blob}"
+        if [[ ! -f "${bl32_path}" ]]; then
+            exit_with_error "BL32 blob missing" "${bl32_path}"
+        fi
 
-    install -m 0644 "${bl32_path}" "${uboot_workdir}/tee.bin" ||
-        exit_with_error "Failed to stage BL32 as tee.bin" "${uboot_workdir}/tee.bin"
-    display_alert "secure-uboot" "Staged BL32 for U-Boot FIT: ${bl32_blob} -> tee.bin" "info"
+        install -m 0644 "${bl32_path}" "${uboot_workdir}/tee.bin" ||
+            exit_with_error "Failed to stage BL32 as tee.bin" "${uboot_workdir}/tee.bin"
+        display_alert "secure-uboot" "Staged BL32 for U-Boot FIT: ${bl32_blob} -> tee.bin" "info"
+    fi
 }
 
 function resolve_kernel_dtb_path() {
@@ -131,6 +203,15 @@ function rk_secure_boot_apply_config_fragment() {
 function enable_optee_bootchain_bl32_fit_node() {
     # Non-secure OP-TEE bootchain still needs BL32 packed into vendor u-boot.itb.
     # Keep this as a narrow local change instead of reusing the full secure-boot overlay.
+    # vendor-next (rockchip-linux/u-boot v5) builds u-boot.itb through binman and
+    # never runs the SPL_FIT_GENERATOR: the tee-1 node comes from TEE= plus the
+    # OP-TEE-v1-wrapped blob staged by rk_secure_boot_stage_bl32_binman, so the
+    # generator edit below would be a no-op on that tree.
+    if [[ "${BRANCH:-}" == "vendor-next" ]]; then
+        display_alert "secure-uboot" "OP-TEE bootchain: binman flow, tee packed via TEE= (fit generator untouched)" "info"
+        return 0
+    fi
+
     local fit_generator="arch/arm/mach-rockchip/make_fit_atf.sh"
 
     if [[ ! -f "${fit_generator}" ]]; then
@@ -171,8 +252,15 @@ function rk_secure_boot_verify_fit_images() {
     if rk_autodecrypt_enabled; then
         grep -Eq 'Image [0-9]+ \(atf-3\)' <<< "${fit_info}" ||
             exit_with_error "FIT image validation failed: missing atf-3 loadable" "${fit_image}"
-        grep -Eq 'Image [0-9]+ \(optee\)' <<< "${fit_info}" ||
-            exit_with_error "FIT image validation failed: missing optee loadable" "${fit_image}"
+        if [[ "${BRANCH:-}" == "vendor-next" ]]; then
+            # Binman generates the TEE node(s) from the @tee-SEQ template as
+            # tee-1/tee-2/...; the vendor fit generator names the node optee.
+            grep -Eq 'Image [0-9]+ \(tee-1\)' <<< "${fit_info}" ||
+                exit_with_error "FIT image validation failed: missing tee-1 loadable" "${fit_image}"
+        else
+            grep -Eq 'Image [0-9]+ \(optee\)' <<< "${fit_info}" ||
+                exit_with_error "FIT image validation failed: missing optee loadable" "${fit_image}"
+        fi
     fi
 
     display_alert "secure-uboot" "FIT image validation passed (${fit_image})" "info"
