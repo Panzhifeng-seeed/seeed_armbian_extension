@@ -56,9 +56,13 @@ function ota_ab_extract_uboot_default_env() {
     # (distro_bootcmd/scan_dev_for_boot) only exists with CONFIG_DISTRO_DEFAULTS;
     # the rockchip-official bootstd shape (v5 vendor chain) carries
     # bootcmd="...bootflow scan -bl;" and the vendor boot_targets string instead.
+    # The signed secure-boot tier is a third shape: FIT_SIGNATURE narrows the
+    # v5 bootcmd to the raw-partition boot_fit leg alone (rockchip-common.h),
+    # leaving neither bootflow nor distro_bootcmd in the env.
     grep -q '^bootcmd=' "${output_env}" &&
         grep -q '^boot_targets=' "${output_env}" && {
-        grep -q '^distro_bootcmd=' "${output_env}" || grep -q 'bootflow' "${output_env}"
+        grep -q '^distro_bootcmd=' "${output_env}" || grep -q 'bootflow' "${output_env}" ||
+            grep -q '^bootcmd=boot_fit' "${output_env}"
     }
 }
 

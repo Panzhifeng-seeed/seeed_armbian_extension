@@ -79,6 +79,20 @@ function ota_uboot_env_prefill_compose() {
     # return, (c) never scans external media. The Seeed boot.scr already
     # carries the armbian.bootdev tokens in its own bootargs, and the rescue
     # branch injects them directly, so no bootargs prefixing is needed here.
+    #
+    # Raw-FIT recovery images (secure-rootfs/secure-boot tiers, BOOT_RAW_MODE
+    # =yes) have no ext4 boot partition: both ota_normal_boot and
+    # ota_rescue_boot ext4load from partition 1 and fail, so the routing env
+    # would drop the first boot into the U-Boot CLI. Until the raw-FIT rescue
+    # path exists (phase 2), ship the compiled default env as-is — its bootstd
+    # bootcmd leads with boot_fit, which boots the raw-partition boot.itb
+    # directly.
+    if ota_raw_boot_enabled; then
+        display_alert "OTA U-Boot env prefill" "raw-FIT recovery image: shipping the default env (boot_fit chain), no ext4 routing env" "info"
+        ota_ab_merge_uboot_env_files "${final_env}" "${default_env}"
+        return 0
+    fi
+
     routing_env="$(mktemp)" || exit_with_error "mktemp failed"
     {
         printf '%s\n' 'ota_in_progress=0'
@@ -160,6 +174,13 @@ for entry in blob[4:].split(b"\0"):
             grep -q '^ab_boot_mode=raw-fit' <<< "${env_info}" ||
                 exit_with_error "Prefilled env lacks raw-fit mode" "ab_boot_mode not carried into blob"
         fi
+    elif ota_raw_boot_enabled; then
+        # Raw-FIT recovery: the default env ships as-is, its bootstd bootcmd
+        # must lead with the raw-partition boot_fit leg.
+        grep -q '^bootcmd=.*boot_fit' <<< "${env_info}" ||
+            exit_with_error "Prefilled env lacks the boot_fit bootcmd" "raw-FIT recovery env not default-shaped"
+        grep -q '^ota_rescue_boot=' <<< "${env_info}" &&
+            exit_with_error "Prefilled env wrongly carries the ext4 routing env" "raw-FIT recovery must not ship ota_rescue_boot"
     else
         grep -q '^ota_rescue_boot=' <<< "${env_info}" ||
             exit_with_error "Prefilled env lacks rescue boot script" "ota_rescue_boot not carried into blob"
