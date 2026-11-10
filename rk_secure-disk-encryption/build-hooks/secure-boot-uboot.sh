@@ -76,10 +76,11 @@ function resolve_kernel_dtb_path() {
     # Resolve kernel DTB path for resource/FIT packaging.
     # Priority:
     # 1) RK_SECURE_KERNEL_DTB absolute path
-    # 2) RK_SECURE_KERNEL_DTB filename under kernel rockchip dtb dir
-    # 3) board + platform based candidate list (BOARD_NAME + BOOT_SOC)
+    # 2) RK_SECURE_KERNEL_DTB filename under the kernel DTB directory
+    # 3) BOOT_FDT_FILE selected by the active board and kernel branch
+    # 4) Legacy board + platform based candidate list
     local kernel_src="$1"
-    local dtb_dir platform board candidate override
+    local dtb_dir platform board candidate override board_dtb
 
     dtb_dir="${kernel_src}/arch/arm64/boot/dts/rockchip"
     override="${RK_SECURE_KERNEL_DTB:-}"
@@ -93,7 +94,23 @@ function resolve_kernel_dtb_path() {
             echo "${dtb_dir}/${override}"
             return 0
         fi
-        display_alert "secure-uboot" "RK_SECURE_KERNEL_DTB not found: ${override}" "warn"
+        exit_with_error "RK_SECURE_KERNEL_DTB not found" "${override}; refusing to sign a FIT for another board"
+        return 1
+    fi
+
+    # Bootloader control FDTs may be under a different board directory, while
+    # BOOT_FDT_FILE is a Linux "vendor/board.dtb" path (for example
+    # "rockchip/rk3576-recomputer-industrial.dtb"). Normalize it against the
+    # kernel's arch/arm64/boot/dts root; falling back to another board's Linux
+    # DTB can disable storage and make the encrypted image unbootable.
+    if [[ -n "${BOOT_FDT_FILE:-}" && "${BOOT_FDT_FILE}" != "none" ]]; then
+        board_dtb="${BOOT_FDT_FILE#/}"
+        [[ "${board_dtb}" == *.dtb ]] ||
+            exit_with_error "BOOT_FDT_FILE must name a DTB" "${BOOT_FDT_FILE}"
+        [[ -f "${kernel_src}/arch/arm64/boot/dts/${board_dtb}" ]] ||
+            { exit_with_error "Board DTB not found for FIT packaging" "${BOOT_FDT_FILE}; kernel=${kernel_src}"; return 1; }
+        echo "${kernel_src}/arch/arm64/boot/dts/${board_dtb}"
+        return 0
     fi
 
     platform="$(rk_detect_platform)"
@@ -107,7 +124,7 @@ function resolve_kernel_dtb_path() {
         done
     fi
 
-    echo ""
+    exit_with_error "Cannot resolve the board DTB for FIT packaging" "set BOOT_FDT_FILE or RK_SECURE_KERNEL_DTB"
 }
 function rk_secure_boot_stage_uboot_fit_generator() {
     local uboot_workdir="$1"

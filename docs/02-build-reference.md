@@ -98,7 +98,7 @@ layout; secure boot applies the same rule to its raw boot partition
 | `UBOOT_FIT_KEYS_BACKUP_DIR` | unset | Reuse/persist FIT signing keys across builds — see [06-secure-boot.md](06-secure-boot.md) |
 | `RK_SECURE_BOOT_MKIMAGE` | auto | Override the FIT signer binary (auto = signing-capable rkbin prebuilt) |
 | `DISABLE_FIT_KEY_GEN` | unset | Skip key generation; incompatible with full secure boot ([`secure-boot-uboot.sh:394`](../rk_secure-disk-encryption/build-hooks/secure-boot-uboot.sh#L394)) |
-| `RK_SECURE_KERNEL_DTB` | unset | Override the kernel DTB packed into the FIT |
+| `RK_SECURE_KERNEL_DTB` | unset | Override the kernel DTB packed into the FIT; otherwise `BOOT_FDT_FILE` selects the active board + kernel-branch DTB. Missing DTBs fail the build rather than silently packaging another board's DTB |
 | [`RK_SECURE_BOOT_ROOTARGS`](../rk_secure-disk-encryption/build-hooks/secure-boot-image.sh#L14) | `root=/dev/mapper/armbian-root rw rootwait` | Kernel root bootargs |
 | [`RK_SECURE_BOOT_EXTRA_BOOTARGS`](../rk_secure-disk-encryption/build-hooks/secure-boot-image.sh#L15) | unset | Extra kernel bootargs |
 | `DEFAULT_OVERLAYS` | unset | Overlays baked into the FIT DTB at build time (secure-boot images have no `/boot` filesystem, so runtime dtbo loading is impossible) |
