@@ -241,7 +241,7 @@ function synthLinks(slots, manifests) {
 
 const BOARD_PAT = /Recomputer-([A-Za-z0-9][A-Za-z0-9-]*?)_/;
 const VER_PAT = /^Armbian[^_]*_([^_]+)/;               // Armbian[-unofficial]_26.11.0-trunk_…
-const REL_PAT = /_([a-z]+)_vendor_([0-9][\w.-]*?)_/;   // …_resolute_vendor_6.1.172_…
+const REL_PAT = /_([a-z]+)_vendor_([0-9][\w.-]*?)(?:_|-crypt(?:_minimal)?|\.img)/; // release + kernel, incl. suffixless CLI
 const VARIANT_TITLE = { cli: "Minimal", desktop: "Desktop" };
 // Row-title icons + the Loader chip — static SVG literals only; svgIcon()
 // parses them into elements (el() is textContent-only by XSS contract).
@@ -264,8 +264,12 @@ function parse(name, size, url, secure, lk) {
   const board = m[1];
   // Secure-boot images append "-crypt" before the variant suffix
   // ("_gnome-crypt_desktop" vs "_gnome_desktop"), so match both orders.
+  // Desktop filenames carry their DE. Standard CLI has neither desktop nor
+  // minimal suffix after --minimal switched to BUILD_MINIMAL=no (d93aeecd):
+  // ..._trixie_vendor_6.1.172.img.xz and ..._6.1.172-crypt[_AB_PART].img.xz.
   const variant = name.indexOf("_gnome_desktop") >= 0 || name.indexOf("_gnome-crypt_desktop") >= 0 ? "desktop"
-                : name.indexOf("_minimal") >= 0 || name.indexOf("-crypt_minimal") >= 0 ? "cli" : null;
+                : name.indexOf("_minimal") >= 0 || name.indexOf("-crypt_minimal") >= 0
+                  || /_vendor_[0-9][\w.-]*(?:-crypt)?(?:_AB_PART)?(?:\.img|_OTA\.)/.test(name) ? "cli" : null;
   if (!variant) return null;
   const mode = name.indexOf("_AB_PART") >= 0 ? "ab" : "recovery";
   const crypt = name.indexOf("-crypt") >= 0;
