@@ -58,6 +58,31 @@ def tree_dirs(base):
     raise DeployError(f"rclone lsjson failed for {base}/trees: {error}")
 
 
+def tree_file_sizes(base, tag):
+    """Read download sizes without changing the immutable per-tag manifest."""
+    result = subprocess.run(
+        ["rclone", "lsjson", "-R", "--files-only", f"{base}/trees/{tag}",
+         "--contimeout", "15s"],
+        capture_output=True, text=True, timeout=120,
+    )
+    if result.returncode != 0:
+        raise DeployError(
+            f"rclone lsjson failed for trees/{tag}: {result.stderr.strip()}"
+        )
+    listing = decode(result.stdout, f"trees/{tag}/")
+    if not isinstance(listing, list):
+        raise DeployError(f"trees/{tag}: invalid file listing")
+    sizes = {}
+    for entry in listing:
+        if (not isinstance(entry, dict) or not isinstance(entry.get("Path"), str)
+                or not entry["Path"] or type(entry.get("Size")) is not int
+                or entry["Size"] < 0):
+            raise DeployError(f"trees/{tag}: invalid file size entry")
+        if entry["Path"] != "manifest.json":
+            sizes[entry["Path"]] = entry["Size"]
+    return sizes
+
+
 def read_mirror(base):
     slots_in = parse_slots(rcat(f"{base}/slots.json"), legacy=False)
     stable, candidate, history = slots_in["stable"], slots_in["pre-release"], slots_in["history"]
@@ -103,12 +128,31 @@ def read_mirror(base):
         if any(not isinstance(path, str) or not path or not isinstance(url, str) or not url
                for path, url in files.items()):
             raise DeployError(f"trees/{tag}/manifest.json has an invalid file link")
+        if "sizes" in manifest:
+            sizes = manifest["sizes"]
+            if (not isinstance(sizes, dict) or set(sizes) != set(files)
+                    or any(type(size) is not int or size < 0 for size in sizes.values())):
+                raise DeployError(f"trees/{tag}/manifest.json has invalid file sizes")
         manifests[tag] = manifest
         return True
+
+    # Only legacy manifests need a file walk; new manifests carry sizes.
+    # The legacy tree stays untouched, and refresh enriches only data.json.
+    def attach_sizes(tag):
+        manifest = manifests[tag]
+        if "sizes" in manifest:
+            return
+        sizes = tree_file_sizes(base, tag)
+        if set(sizes) != set(manifest["files"]):
+            raise DeployError(
+                f"trees/{tag}: manifest and file listing differ; refusing to publish sizes"
+            )
+        manifest["sizes"] = sizes
 
     for slot, tag in (("pre-release", candidate), ("stable", stable)):
         if tag:
             take(tag)
+            attach_sizes(tag)
             page_slots[slot] = tag
     seen = set()
     present_history = []
@@ -132,6 +176,7 @@ def read_mirror(base):
                 )
                 continue
             if take(tag, optional=True):
+                attach_sizes(tag)
                 present_history.append(tag)
     if present_history:
         page_slots["history"] = present_history

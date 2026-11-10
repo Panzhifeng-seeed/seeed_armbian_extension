@@ -771,7 +771,14 @@ jobs:
           # Map tree-relative file paths to links in one manifest.
           # Exclude the manifest itself from this initial walk.
           entries = rclone_json("lsjson", "-R", "--files-only", f"{IBASE}/trees/{tag}")
-          rel_files = [it["Path"] for it in entries if it["Path"] != "manifest.json"]
+          file_sizes = {
+              it["Path"]: it["Size"] for it in entries
+              if it["Path"] != "manifest.json"
+          }
+          if any(type(size) is not int or size < 0 for size in file_sizes.values()):
+              print(f"::error::trees/{tag} returned an invalid file size", file=sys.stderr)
+              sys.exit(1)
+          rel_files = list(file_sizes)
           if not rel_files:
               print(f"::error::trees/{tag} is empty — refusing to publish", file=sys.stderr)
               sys.exit(1)
@@ -836,6 +843,7 @@ jobs:
               "extension": {"repo": os.environ["GITHUB_REPOSITORY"],
                             "commit": os.environ["EXTENSION_SHA"]},
               "files": files_map,
+              "sizes": file_sizes,
           }
           rcat(f"{IBASE}/trees/{tag}/manifest.json", json.dumps(manifest, indent=1, sort_keys=True))
           print(f"manifest written into trees/{tag}/: {len(files_map)} links, {len(failures)} failures")

@@ -109,7 +109,10 @@ armbian/<owner>/images/trees/<tag>/<board>/<plain|secure>/<recovery|ab|loaders>/
 `slots.json` identifies the current pre-release, stable and history tags.
 After all matrix entries upload, the release job creates a per-file share
 link and writes them to `trees/<tag>/manifest.json`, then points
-`slots.json.pre-release` at the tag and flips the Release visible.
+`slots.json.pre-release` at the tag and flips the Release visible. The page
+shows each Image/OTA download size. New manifests include file sizes; Pages
+reads sizes from the mirror only for legacy manifests that lack them, so
+existing trees gain sizes without rebuilding or modifying their manifests.
 Promotion validates the complete referenced trees, updates the pointers
 (`stable ⟵ pre-release`, previous stable joins the bounded history), and
 moves no image files. The OneDrive tree for an expired stable may be

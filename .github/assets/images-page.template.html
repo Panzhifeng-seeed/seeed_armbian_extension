@@ -17,7 +17,7 @@
     { repo,                         CFG.repo — GitHub release links
       slots:  { "stable": tag?, "pre-release": tag?,
                 "history": [tag, ...] },          (0..N older stables)
-      manifests: { tag: { files: {relpath: url} } },
+      manifests: { tag: { files: {relpath: url}, sizes: {relpath: bytes} } },
       releases: [{tag_name, prerelease, published_at}, ...] }
     where a relpath is "<board>/<sec>/<kind>/[ota/]<file>" — sec is
     plain|secure, kind is recovery|ab|loaders. ONE namespace: the
@@ -54,7 +54,7 @@
   body { margin: 0; font: 15px/1.65 -apple-system, "Segoe UI", "Noto Sans SC", sans-serif;
          background: #f3f5f8; color: #03353f; }
   header { background: #03353f; color: #fff; padding: 34px 0 30px; }
-  main { max-width: 920px; margin: 0 auto; padding: 0 20px; }
+  main { max-width: 980px; margin: 0 auto; padding: 0 20px; }
   h1 { font-size: 26px; margin: 0 0 6px; letter-spacing: .5px; }
   h1 em { color: #8dc215; font-style: normal; }
   /* anchor nav under the title: pill links color-matched to their slot
@@ -116,13 +116,19 @@
   .row-info { color: #2c6fbf; font-size: 12.5px; text-decoration: underline;
               text-decoration-style: dotted; margin-left: 8px; }
   .row-info:hover { color: #1a4d8f; }
-  .row-links { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
-  /* button groups separated by a vertical rule:
-     [Image sha256] | [OTA checksum] */
-  /* groups never split mid-pair; a too-narrow row wraps the WHOLE group,
-     keeping row starts aligned */
-  .grp { display: inline-flex; flex-wrap: nowrap; gap: 8px; }
+  .row-links { display: flex; flex-wrap: nowrap; gap: 8px; align-items: center;
+               overflow-x: auto; padding-bottom: 2px; }
+  /* Secure size text stays black, not the primary button's white. */
+  .file-size { font-size: 12px; font-weight: 400; white-space: nowrap; opacity: .9; }
+  .btn.primary .file-size { color: #fff; }
+  .btn.secure .file-size, .btn.secure-loader .file-size { color: #03353f; }
+  /* Keep each download row on one line; narrow screens scroll the row. */
+  .grp { display: inline-flex; align-items: center; flex: 0 0 auto; flex-wrap: nowrap; gap: 8px; }
   .grp + .grp { margin-left: 16px; padding-left: 18px; border-left: 1px solid #d7dee5; }
+  /* Loader types are independent rows, not an Image/OTA separator pair. */
+  .loader-links { flex-direction: column; align-items: flex-start; gap: 7px;
+                  overflow-x: visible; }
+  .loader-links .grp + .grp { margin-left: 0; padding-left: 0; border-left: none; }
   .badge { font-size: 11px; border-radius: 4px; padding: 0 6px; margin-left: 6px;
            vertical-align: 2px; }
   .btn { display: inline-block; padding: 3px 12px; border-radius: 999px; font-size: 13px;
@@ -208,6 +214,7 @@ let CFG = Object.freeze({ repo: "" });
 let LINKS = {};
 let RELEASES = [];
 let SLOTS = {};
+let SIZES = {};
 
 async function loadData() {
   // {cache: no-cache} — revalidate past the CDN's ~10-min edge window
@@ -218,17 +225,16 @@ async function loadData() {
   CFG = Object.freeze({ repo: String(d.repo || "") });
   SLOTS = (d.slots && typeof d.slots === "object") ? d.slots : {};
   RELEASES = Array.isArray(d.releases) ? d.releases : [];
-  LINKS = synthLinks(SLOTS, (d.manifests && typeof d.manifests === "object") ? d.manifests : {});
+  const manifests = (d.manifests && typeof d.manifests === "object") ? d.manifests : {};
+  LINKS = synthLinks(SLOTS, manifests, "files");
+  SIZES = synthLinks(SLOTS, manifests, "sizes");
 }
 
-// slots + manifests → the flat path→URL map the page consumes:
-// "<slot>/<board>/<sec>/<kind>/..." (ONE namespace — loaders ride the
-// same map, distinguished by the kind segment). History tags prefix
-// "history/<tag>/". Single implementation (was deploy-pages python).
-function synthLinks(slots, manifests) {
+// slots + manifests → flat path→value maps for download links and sizes.
+function synthLinks(slots, manifests, field) {
   const links = {};
   const emit = (prefix, m) => {
-    const files = m.files || {};
+    const files = m[field] || {};
     for (const k in files) links[prefix + "/" + k] = files[k];
   };
   for (const slot of ["pre-release", "stable"])
@@ -342,6 +348,17 @@ function el(tag, cls, text) {
   return e;
 }
 
+function fmtSize(bytes) {
+  if (!Number.isSafeInteger(bytes) || bytes < 0) return "";
+  const units = ["B", "KiB", "MiB", "GiB", "TiB"];
+  let value = bytes, unit = 0;
+  while (value >= 1024 && unit < units.length - 1) {
+    value /= 1024;
+    unit++;
+  }
+  return value.toFixed(unit === 0 || value >= 10 ? 0 : 1) + " " + units[unit];
+}
+
 // opts: {suppressAb, suppressCrypt, secure} — badge/box-title redundancy
 // control and the yellow secure button style
 function buildRow(entry, opts, slot) {
@@ -364,8 +381,7 @@ function buildRow(entry, opts, slot) {
   }
   head.prepend(title);
 
-  // links: [Image sha256] | [OTA checksum] — groups split by a vertical
-  // rule; no sizes; primary buttons go yellow in Secure boxes
+  // links: [Image · size] [sha256] | [OTA · size] [checksum]
   const links = el("div", "row-links");
   for (const group of GROUPS) {
     const present = group.filter(k => entry.d && entry.d[k]);
@@ -380,6 +396,8 @@ function buildRow(entry, opts, slot) {
       // the exact LINKS key carried on the asset — filenames repeat across
       // profile dirs, so a lookup by name can grab the twin's link.
       a.href = (v.lk && LINKS[v.lk]) || v.url || "#";
+      const size = primary ? fmtSize(v.size) : "";
+      if (size) a.appendChild(el("span", "file-size", " · " + size));
       grp.appendChild(a);
     }
     links.appendChild(grp);
@@ -434,6 +452,8 @@ function loaderGroup(parent, label, lk, cls) {
   const a = el("a", cls, label);
   a.href = LINKS[lk] || "#";
   a.title = lk.split("/").pop();
+  const size = fmtSize(SIZES[lk]);
+  if (size) a.appendChild(el("span", "file-size", " · " + size));
   grp.appendChild(a);
   const sha = el("a", "btn", "sha256");
   sha.href = LINKS[lk + ".sha256"] || "#";
@@ -454,7 +474,7 @@ function buildLoaderBox(secure, lds, slot) {
     secure ? " - signed maskrom / SPI flash" : " - maskrom / SPI flash"));
   box.appendChild(h3);
   const row = el("div", "row");
-  const links = el("div", "row-links");
+  const links = el("div", "row-links loader-links");
   const cls = secure ? "btn secure-loader" : "btn loader";
   loaderGroup(links, "Maskrom", bySec.maskrom, cls);
   if (bySec.spi) loaderGroup(links, "SPI Flash", bySec.spi, cls);
@@ -585,7 +605,8 @@ function slotAssets(slotDir) {
   // (plain|secure) is the ONLY secure marker (filenames are identical
   // across profiles) — carry it into `secure`. Loader rows are not
   // image assets; slotLoaders() walks them from the same map.
-  // Size is 0 (the manifest carries no sizes).
+  // New manifests carry sizes; legacy ones gain them during Pages
+  // deployment without modifying their immutable manifest.
   return Object.keys(LINKS)
     .filter(path => {
       if (!path.startsWith(slotDir + "/")) return false;
@@ -594,7 +615,7 @@ function slotAssets(slotDir) {
     })
     .map(path => ({
       name: path.split("/").pop(),
-      size: 0,
+      size: SIZES[path],
       browser_download_url: LINKS[path],
       secure: path.slice(slotDir.length + 1).split("/")[1] === "secure",
       lk: path,

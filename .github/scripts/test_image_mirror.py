@@ -91,7 +91,7 @@ class RefreshTest(unittest.TestCase):
             "history": ["expired", "old"],
         }
 
-    def read(self, trees):
+    def read(self, trees, sizes=None):
         def fake_cat(path):
             if path.endswith("/slots.json"):
                 return json.dumps(self.slots)
@@ -104,8 +104,71 @@ class RefreshTest(unittest.TestCase):
             })
 
         with patch.object(deploy, "rcat", side_effect=fake_cat), \
+                patch.object(deploy, "tree_file_sizes",
+                             side_effect=sizes
+                             or (lambda _base, tag: {f"{tag}.img.xz": 123456789})), \
                 patch.object(deploy, "tree_dirs", return_value=trees):
             return deploy.read_mirror("mirror")
+
+    def test_legacy_manifest_sizes_are_read_once(self):
+        sizes = unittest.mock.Mock(
+            side_effect=lambda _base, tag: {f"{tag}.img.xz": 123456789}
+        )
+        core = self.read({"stable", "old"}, sizes=sizes)
+        self.assertEqual(sizes.call_count, 2)
+        for tag in ("stable", "old"):
+            manifest = core["manifests"][tag]
+            self.assertEqual(manifest["sizes"], {f"{tag}.img.xz": 123456789})
+            self.assertEqual(
+                manifest["files"], {f"{tag}.img.xz": "https://example.invalid/image"}
+            )
+
+    def test_present_manifest_sizes_skip_file_walk(self):
+        sizes = {"stable.img.xz": 123456789}
+        self.slots["history"] = []
+
+        def fake_cat(path):
+            if path.endswith("/slots.json"):
+                return json.dumps(self.slots)
+            return json.dumps({
+                "tag": "stable", "files": {"stable.img.xz": "url"}, "sizes": sizes,
+            })
+
+        with patch.object(deploy, "rcat", side_effect=fake_cat), \
+                patch.object(deploy, "tree_file_sizes") as walk, \
+                patch.object(deploy, "tree_dirs", return_value={"stable", "old"}):
+            core = deploy.read_mirror("mirror")
+        walk.assert_not_called()
+        self.assertEqual(core["manifests"]["stable"]["sizes"], sizes)
+
+    def test_present_manifest_sizes_are_validated(self):
+        def fake_cat(path):
+            if path.endswith("/slots.json"):
+                return json.dumps(self.slots)
+            return json.dumps({
+                "tag": "stable", "files": {"stable.img.xz": "url"},
+                "sizes": {"stable.img.xz": "118 MiB"},
+            })
+
+        with patch.object(deploy, "rcat", side_effect=fake_cat), \
+                patch.object(deploy, "tree_file_sizes") as walk, \
+                self.assertRaisesRegex(deploy.DeployError, "invalid file sizes"):
+            deploy.read_mirror("mirror")
+        walk.assert_not_called()
+
+    def test_size_listing_must_match_manifest(self):
+        def fake_cat(path):
+            if path.endswith("/slots.json"):
+                return json.dumps(self.slots)
+            return json.dumps({
+                "tag": "stable", "files": {"stable.img.xz": "url"},
+            })
+
+        with patch.object(deploy, "rcat", side_effect=fake_cat), \
+                patch.object(deploy, "tree_file_sizes", return_value={"other.img.xz": 123}), \
+                patch.object(deploy, "tree_dirs", return_value={"stable", "old"}), \
+                self.assertRaisesRegex(deploy.DeployError, "refusing to publish sizes"):
+            deploy.read_mirror("mirror")
 
     def test_absent_history_is_omitted(self):
         core = self.read({"stable", "old"})
@@ -128,9 +191,13 @@ class RefreshTest(unittest.TestCase):
                 return json.dumps(self.slots)
             if path.endswith("/old/manifest.json"):
                 raise deploy.DeployError("OneDrive unavailable")
-            return json.dumps({"tag": "stable", "files": {"image": "url"}})
+            return json.dumps({
+                "tag": "stable", "files": {"stable.img.xz": "url"},
+            })
 
         with patch.object(deploy, "rcat", side_effect=fail), \
+                patch.object(deploy, "tree_file_sizes",
+                             return_value={"stable.img.xz": 123}), \
                 patch.object(deploy, "tree_dirs", return_value={"stable", "old"}):
             core = deploy.read_mirror("mirror")
         self.assertEqual(core["slots"], {"stable": "stable"})
