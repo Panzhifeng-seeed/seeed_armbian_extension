@@ -234,14 +234,23 @@ function rk_secure_boot_run_secondary_fit_signing() {
         fit_padding="0x1200"
     fi
 
-    # The boot FIT carries padding = "pss", and the on-board verifiers (SPL /
-    # U-Boot from the radxa v2024.10 tree) only accept maximum-salt PSS
-    # signatures.  A tree-built mkimage linked against OpenSSL >= 3.5 signs
-    # with digest-length salt, which the device rejects.  Sign with the
-    # Rockchip prebuilt mkimage instead: it is statically linked, so its
-    # maximum-salt behaviour is frozen into the binary regardless of the
-    # build container's OpenSSL.
-    [[ -x "${RK_SECURE_BOOT_MKIMAGE}" ]] || rk_secure_boot_resolve_mkimage
+    # The boot FIT carries padding = "pss". On the 2017.09 radxa v2024.10
+    # tree the on-device verifiers only accept maximum-salt PSS signatures,
+    # while a tree-built mkimage linked against OpenSSL >= 3.5 signs with
+    # digest-length salt — hence the Rockchip prebuilt mkimage there: it is
+    # statically linked, so its maximum-salt behaviour is frozen into the
+    # binary regardless of the build container's OpenSSL. The vendor-next v5
+    # tree flips both halves: its padding_pss_verify() recovers the salt
+    # length from the signature (any salt verifies), and its verify code —
+    # shared by the SPL, U-Boot and the tree-built fit_check_sign gate —
+    # rebuilds the hashed node list from the config, which the prebuilt
+    # 2017.09-era mkimage signing does not match. Sign with the tree-built
+    # mkimage on that branch.
+    if [[ "${BRANCH:-}" == "vendor-next" ]]; then
+        RK_SECURE_BOOT_MKIMAGE="${uboot_dir}/tools/mkimage"
+    else
+        [[ -x "${RK_SECURE_BOOT_MKIMAGE}" ]] || rk_secure_boot_resolve_mkimage
+    fi
 
     # USBPLUG postprocessing can leave a stale tools/mkimage built from a
     # temporary config without CONFIG_FIT_SIGNATURE.  That also leaves

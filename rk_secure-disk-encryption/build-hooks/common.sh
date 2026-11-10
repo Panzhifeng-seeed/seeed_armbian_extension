@@ -134,13 +134,18 @@ function rk_secure_uboot_config_fragment_path() {
 
     extension_dir="$(rk_resolve_extension_dir "u-boot/fragments")"
     # vendor-next (rockchip-linux/u-boot v5) builds u-boot.itb through binman:
-    # the SPL_FIT_GENERATOR line is a no-op there, and FIT_SIGNATURE/SPL_FIT_
-    # SIGNATURE must stay off for the unsigned secure-rootfs tier — with
-    # FIT_SIGNATURE=y the v5 rockchip-common.h narrows bootcmd to "boot_fit;"
-    # alone, dropping the bootflow leg the bootstd default-env contract
-    # requires (and the raw-FIT boot path needs no signature before the
-    # secure-boot tier). The v5 fragments therefore carry only the bootargs.
+    # the SPL_FIT_GENERATOR line is a no-op there. The two v5 tiers split on
+    # FIT_SIGNATURE: with it set the v5 rockchip-common.h narrows bootcmd to
+    # "boot_fit;" alone — the intended shape for the signed secure-boot tier,
+    # but it drops the bootflow leg the bootstd default-env contract requires
+    # for the unsigned secure-rootfs tier (whose raw-FIT boot path needs no
+    # signature). The secure-rootfs v5 fragments therefore carry only the
+    # bootargs; the secure-boot v5 fragments add the signature pair on top.
     if [[ "${BRANCH:-}" == "vendor-next" ]]; then
+        if rk_full_secure_boot_enabled; then
+            candidate="${extension_dir}/u-boot/fragments/${platform}-secure-boot-v5.config"
+            [[ -f "${candidate}" ]] && { echo "${candidate}"; return 0; }
+        fi
         candidate="${extension_dir}/u-boot/fragments/${platform}-secure-autodecrypt-v5.config"
         [[ -f "${candidate}" ]] && { echo "${candidate}"; return 0; }
     fi

@@ -388,6 +388,274 @@ function rk_secure_boot_repack_signed_spl() {
     cat "${spl_dtb}" >> "${spl_bin}" || exit_with_error "Failed to append signed SPL DTB" "${spl_bin}"
 }
 
+function rk_secure_boot_generate_uboot_its_binman() {
+    # Rebuild an ITS for the binman-assembled u-boot.itb. binman owns the FIT
+    # assembly on the v5 tree (there is no u-boot.its to sign like on the
+    # 2017.09 tree), but it leaves a fully formed mkimage description behind:
+    # simple-bin.fit.fit records every image's load/entry/type/os and its
+    # data-offset/data-size, and u-boot.itb stores the payloads externally,
+    # base = FIT_ALIGN(fdt_totalsize) (the SPL's own ext_data_offset rule,
+    # IMAGE_ALIGN_SIZE=512). This script extracts the payloads from that itb,
+    # cross-checks the two copies that also exist as files (fdt-1 must equal
+    # the in-tree u-boot.dtb — pass A injects the boot-FIT key into it; tee-1
+    # must equal tee.bin without its OP-TEE v1 header) and emits an ITS with
+    # a hash node per image plus the configuration signature node that mkimage
+    # signs and -K injects.
+    local desc_dtb="$1" fit_itb="$2" uboot_dtb="$3" tee_bin="$4" out_dir="$5" its_path="$6" rsa_bits="$7"
+
+    if ! python3 - "${desc_dtb}" "${fit_itb}" "${uboot_dtb}" "${tee_bin}" "${out_dir}" "${its_path}" "${rsa_bits}" <<'PY'
+import struct
+import sys
+
+FDT_BEGIN_NODE, FDT_END_NODE, FDT_PROP, FDT_NOP, FDT_END = 1, 2, 3, 4, 9
+
+
+class Node:
+    def __init__(self, name):
+        self.name = name
+        self.props = {}
+        self.subnodes = []
+
+
+def parse_fdt(data, label):
+    magic, totalsize, off_struct, off_strings = struct.unpack_from(">IIII", data, 0)
+    if magic != 0xD00DFEED:
+        raise SystemExit(f"{label}: not an FDT blob")
+    pos, stack, root = off_struct, [], None
+    while True:
+        token = struct.unpack_from(">I", data, pos)[0]
+        pos += 4
+        if token == FDT_BEGIN_NODE:
+            end = data.index(b"\0", pos)
+            node = Node(data[pos:end].decode())
+            pos = (end + 1 + 3) & ~3
+            if stack:
+                stack[-1].subnodes.append(node)
+            elif root is None:
+                root = node
+            stack.append(node)
+        elif token == FDT_END_NODE:
+            stack.pop()
+        elif token == FDT_PROP:
+            length, nameoff = struct.unpack_from(">II", data, pos)
+            pos += 8
+            value = data[pos:pos + length]
+            pos = (pos + length + 3) & ~3
+            nstart = off_strings + nameoff
+            name = data[nstart:data.index(b"\0", nstart)].decode()
+            stack[-1].props[name] = value
+        elif token == FDT_NOP:
+            continue
+        elif token == FDT_END:
+            break
+        else:
+            raise SystemExit(f"{label}: unexpected FDT token 0x{token:x}")
+    return root, totalsize
+
+
+def cell(node, name):
+    return struct.unpack(">I", node.props[name])[0]
+
+
+def text(node, name):
+    return node.props[name].rstrip(b"\0").decode()
+
+
+def strlist(node, name):
+    return [p.decode() for p in node.props[name].rstrip(b"\0").split(b"\0") if p]
+
+
+desc_path, itb_path, uboot_dtb_path, tee_path, out_dir, its_path, rsa_bits = (
+    sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5], sys.argv[6], int(sys.argv[7]))
+
+desc, _ = parse_fdt(open(desc_path, "rb").read(), desc_path)
+itb_bytes, itb_base = None, 0
+images_node = confs_node = None
+for sub in desc.subnodes:
+    if sub.name == "images":
+        images_node = sub
+    elif sub.name == "configurations":
+        confs_node = sub
+if images_node is None or confs_node is None:
+    raise SystemExit(f"{desc_path}: missing images/configurations nodes")
+
+config = None
+for sub in confs_node.subnodes:
+    if sub.name == text(confs_node, "default"):
+        config = sub
+if config is None:
+    raise SystemExit(f"{desc_path}: default configuration not found")
+
+# The reference signatures: mkimage with -E only keeps data-offset/data-size
+# in the description, so the payloads are recovered from the built itb, whose
+# header ends exactly at FIT_ALIGN(totalsize) — the base SPL uses too.
+itb_data = open(itb_path, "rb").read()
+_, itb_header = parse_fdt(itb_data, itb_path)
+itb_base = (itb_header + 511) & ~511
+
+tee_raw = open(tee_path, "rb").read()
+if tee_raw[:5] != b"OPTE\x01":
+    raise SystemExit(f"{tee_path}: missing OP-TEE v1 wrapper header")
+
+payloads = {}
+for image in images_node.subnodes:
+    doff, dsize = cell(image, "data-offset"), cell(image, "data-size")
+    blob = itb_data[itb_base + doff:itb_base + doff + dsize]
+    if len(blob) != dsize:
+        raise SystemExit(f"{itb_path}: {image.name} payload truncated "
+                         f"({len(blob)} != {dsize})")
+    if image.name.startswith("fdt"):
+        if blob != open(uboot_dtb_path, "rb").read():
+            raise SystemExit(f"{itb_path}: {image.name} payload does not match "
+                             f"{uboot_dtb_path}; rebuild before signing")
+    else:
+        if image.name.startswith("tee") and blob != tee_raw[28:]:
+            raise SystemExit(f"{itb_path}: {image.name} payload does not match "
+                             f"the raw blob inside {tee_path}")
+        with open(f"{out_dir}/{image.name}.bin", "wb") as out:
+            out.write(blob)
+    payloads[image.name] = image
+
+# sign-images names the configuration's image-reference properties; the
+# on-device verifier rebuilds its hash list from every reference present, so
+# the signature must cover all of them.
+sign_images = [p for p in ("fdt", "firmware", "loadables") if p in config.props]
+
+lines = ["/dts-v1/;", "", "/ {", "\tdescription = \"Secure signed U-Boot FIT (binman inputs)\";",
+         "\t#address-cells = <0x1>;", "", "\timages {"]
+for image in images_node.subnodes:
+    data_file = uboot_dtb_path if image.name.startswith("fdt") else f"{out_dir}/{image.name}.bin"
+    lines.append(f"\t\t{image.name} {{")
+    lines.append(f"\t\t\tdescription = \"{text(image, 'description')}\";")
+    lines.append(f"\t\t\tdata = /incbin/(\"{data_file}\");")
+    lines.append(f"\t\t\ttype = \"{text(image, 'type')}\";")
+    # flat_dt entries carry no os/arch/load/entry; emit only what the
+    # binman description records so the signed FIT keeps the exact layout.
+    for prop in ("os", "arch", "compression", "load", "entry"):
+        if prop not in image.props:
+            continue
+        value = (f"0x{cell(image, prop):x}" if prop in ("load", "entry")
+                 else text(image, prop))
+        lines.append(f"\t\t\t{prop} = \"{value}\";" if prop in ("os", "arch", "compression")
+                     else f"\t\t\t{prop} = <{value}>;")
+    lines += ["\t\t\thash-1 {", "\t\t\t\talgo = \"sha256\";", "\t\t\t};",
+              "\t\t};", ""]
+lines += ["\t};", "", "\tconfigurations {", f"\t\tdefault = \"{config.name}\";",
+          f"\t\t{config.name} {{",
+          f"\t\t\tdescription = \"{text(config, 'description')}\";"]
+for prop in ("fdt", "firmware", "loadables"):
+    if prop in config.props:
+        values = strlist(config, prop)
+        shown = values if prop == "loadables" else values[:1]
+        rendered = ", ".join(f"\"{v}\"" for v in shown)
+        lines.append(f"\t\t\t{prop} = {rendered};")
+lines += ["\t\t\tsignature-1 {",
+          f"\t\t\t\talgo = \"sha256,rsa{rsa_bits}\";",
+          "\t\t\t\tpadding = \"pss\";",
+          "\t\t\t\tkey-name-hint = \"dev\";",
+          "\t\t\t\tsign-images = " + ", ".join(f"\"{p}\"" for p in sign_images) + ";",
+          "\t\t\t\trequired = \"conf\";",
+          "\t\t\t};",
+          "\t\t};", "\t};", "};"]
+with open(its_path, "w") as out:
+    out.write("\n".join(lines) + "\n")
+print(f"generated {its_path}: {len(payloads)} images, sign-images={' '.join(sign_images)}")
+PY
+    then
+        exit_with_error "Failed to generate the signed-FIT ITS from binman artifacts" "${its_path}"
+    fi
+    display_alert "secure-uboot" "Generated signed-FIT ITS from binman description: ${its_path}" "info"
+}
+
+function rk_secure_boot_sign_uboot_fit_binman() {
+    # vendor-next (rockchip-linux/u-boot v5): binman owns the FIT assembly, so
+    # the 2017.09-style "sign the generated u-boot.its" path has no input.
+    # Rebuild the ITS from binman's artifacts instead, then keep the proven
+    # tail: two mkimage passes (the first injects the boot-FIT public key into
+    # the control dtb so the DTB embedded as fdt-1 is the trusted one the
+    # running U-Boot verifies boot.itb with; the second signs the FIT and
+    # injects its key into the SPL dtb), the tree-built fit_check_sign gate,
+    # SPL repack, idbloader rebuild and loader-artifact signing.
+    #
+    # The signer is the TREE-BUILT mkimage, not the Rockchip prebuilts: the
+    # v5 verify code (boot/image-fit-sig.c, identical in the SPL, U-Boot and
+    # the host fit_check_sign) rebuilds the hashed node list from the config
+    # and ignores hashed-nodes, which the 2017.09-era prebuilt mkimage's
+    # signing does not match — prebuilt-signed FITs fail this very gate. The
+    # v5 padding_pss_verify() recovers the salt length from the signature, so
+    # the 2017.09 chain's maximum-salt mkimage constraint does not apply here.
+    local platform keys_dir rk_sign_tool fit_work rsa_bits
+    platform="$(rk_detect_platform)"
+    keys_dir="${UBOOT_FIT_KEYS_DIR:-${PWD}/keys}"
+    rk_sign_tool="$(command -v rk_sign_tool 2>/dev/null || true)"
+    if [[ -z "${rk_sign_tool}" && -n "${RKBIN_DIR:-}" && -x "${RKBIN_DIR}/tools/rk_sign_tool" ]]; then
+        rk_sign_tool="${RKBIN_DIR}/tools/rk_sign_tool"
+    fi
+    [[ -n "${rk_sign_tool}" ]] || rk_sign_tool="$(resolve_platform_rkbin_dir)/tools/rk_sign_tool"
+
+    [[ "${platform}" != "unknown" ]] || exit_with_error "Cannot sign U-Boot FIT for unknown Rockchip platform" "BOOT_SOC=${BOOT_SOC:-}"
+    [[ -f .config && -f simple-bin.fit.fit && -f u-boot.itb && -f u-boot.dtb && -f tee.bin ]] ||
+        exit_with_error "U-Boot binman artifacts missing for signing" "${PWD}"
+    [[ -f spl/u-boot-spl.dtb && -f spl/u-boot-spl-nodtb.bin ]] ||
+        exit_with_error "U-Boot SPL artifacts missing for signing" "${PWD}/spl"
+    [[ -x tools/mkimage && -x tools/fit_check_sign ]] || exit_with_error "Rockchip FIT signing tools missing" "${PWD}"
+    command -v fdtget >/dev/null 2>&1 || exit_with_error "fdtget is required for secure U-Boot FIT signing" "host dependency missing"
+    [[ -x "${rk_sign_tool}" ]] || exit_with_error "rk_sign_tool missing for secure U-Boot build" "${rk_sign_tool}"
+    [[ -f "${keys_dir}/dev.key" && -f "${keys_dir}/dev.pubkey" && -f "${keys_dir}/dev.crt" ]] ||
+        exit_with_error "FIT signing key material missing" "${keys_dir}"
+    grep -qx 'CONFIG_FIT_SIGNATURE=y' .config || exit_with_error "CONFIG_FIT_SIGNATURE must be enabled for full secure boot" ".config"
+    grep -qx 'CONFIG_SPL_FIT_SIGNATURE=y' .config || exit_with_error "CONFIG_SPL_FIT_SIGNATURE must be enabled for full secure boot" ".config"
+    grep -qx 'CONFIG_FIT_ENABLE_RSASSA_PSS_SUPPORT=y' .config || exit_with_error "CONFIG_FIT_ENABLE_RSASSA_PSS_SUPPORT must be enabled for full secure boot" ".config"
+
+    rsa_bits=2048
+    case "$(openssl rsa -in "${keys_dir}/private_key.pem" -noout -text 2>/dev/null | grep -oE '[0-9]+ bit' | head -n1)" in
+        4096*) rsa_bits=4096 ;;
+    esac
+
+    fit_work="fit/sign-work"
+    rm -rf "${fit_work}"
+    mkdir -p "${fit_work}" || exit_with_error "Failed to create signed-FIT work directory" "${PWD}/${fit_work}"
+    rk_secure_boot_generate_uboot_its_binman simple-bin.fit.fit u-boot.itb \
+        "${PWD}/u-boot.dtb" "${PWD}/tee.bin" "${PWD}/${fit_work}" \
+        "${PWD}/${fit_work}/uboot-signed.its" "${rsa_bits}"
+
+    # The USBPLUG postprocess rebuilds host tools with its temporary config,
+    # leaving mkimage without FIT-signature support. Restore the host tools
+    # from the final secure U-Boot configuration before signing the FIT.
+    if tools/mkimage -h 2>&1 | grep -q 'Signing / verified boot not supported'; then
+        make -B tools-only || exit_with_error "Failed to rebuild FIT-signing U-Boot host tools" "${PWD}/tools"
+    fi
+
+    rm -f fit/uboot.itb
+    if ! fdtget -l u-boot.dtb /signature >/dev/null 2>&1; then
+        tools/mkimage -f "${fit_work}/uboot-signed.its" -k "${keys_dir}" -K u-boot.dtb \
+            -E -p 0x1000 -r "${fit_work}/uboot-passA.itb" ||
+            exit_with_error "Failed to inject the boot FIT public key into U-Boot DTB" "u-boot.dtb"
+        rm -f "${fit_work}/uboot-passA.itb"
+    fi
+    tools/mkimage -f "${fit_work}/uboot-signed.its" -k "${keys_dir}" -K spl/u-boot-spl.dtb \
+        -E -p 0x1000 -r fit/uboot.itb ||
+        exit_with_error "Failed to sign the binman-built U-Boot FIT" "${platform}"
+
+    fdtget -l u-boot.dtb /signature 2>/dev/null | grep -qx 'key-dev' ||
+        exit_with_error "FIT public key was not embedded in U-Boot control DTB" "u-boot.dtb"
+    fdtget -l spl/u-boot-spl.dtb /signature 2>/dev/null | grep -qx 'key-dev' ||
+        exit_with_error "FIT public key was not embedded in SPL DTB" "spl/u-boot-spl.dtb"
+    fdtget -p fit/uboot.itb /configurations/config-1/signature-1 2>/dev/null | grep -qx 'value' ||
+        exit_with_error "U-Boot FIT configuration was not signed" "fit/uboot.itb"
+
+    install -m 0644 fit/uboot.itb u-boot.itb || exit_with_error "Failed to install signed U-Boot FIT" "u-boot.itb"
+    tools/fit_check_sign -f u-boot.itb -k spl/u-boot-spl.dtb -s ||
+        exit_with_error "Signed U-Boot FIT verification failed" "u-boot.itb"
+
+    rk_secure_boot_minimize_spl_fit_key
+    rk_secure_boot_repack_signed_spl
+    rk_secure_boot_rebuild_idbloader
+    rk_secure_boot_sign_loader_artifacts "${rk_sign_tool}" "${platform}" "${keys_dir}"
+    rk_secure_boot_rebuild_spi_loader
+    display_alert "secure-uboot" "Signed U-Boot FIT, embedded SPL key, and loader artifacts (binman form)" "info"
+}
+
 function rk_secure_boot_sign_uboot_fit() {
     # Sign the Armbian-built ITS directly. Do not call Rockchip scripts/fit.sh:
     # with CONFIG_FIT_SIGNATURE it invokes make.sh --raw-compile and silently
@@ -395,6 +663,11 @@ function rk_secure_boot_sign_uboot_fit() {
     # This hook instead injects the public key into the existing SPL DTB,
     # repacks the existing SPL, and host-verifies the resulting FIT.
     rk_full_secure_boot_enabled || return 0
+
+    if [[ "${BRANCH:-}" == "vendor-next" ]]; then
+        rk_secure_boot_sign_uboot_fit_binman
+        return 0
+    fi
 
     local platform keys_dir rk_sign_tool signed_fit fit_padding
     platform="$(rk_detect_platform)"
