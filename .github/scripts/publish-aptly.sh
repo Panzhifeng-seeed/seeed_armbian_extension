@@ -2,7 +2,7 @@
 #
 # publish-aptly.sh — 使用 aptly 构建 apt 仓库并发布到 GitHub Pages
 #
-# 用法: ./scripts/publish-aptly.sh <debs-dir>
+# 用法: ./.github/scripts/publish-aptly.sh <debs-dir>
 #
 # 创建 distribution:
 #   stable     — 所有发行版通用（bookworm 构建，向前兼容）
@@ -110,9 +110,11 @@ echo ""
 echo "=== Done ==="
 echo "APT Repository published successfully!"
 
-# Compute Pages URL from GITHUB_REPOSITORY (works for forks). Falls back to the
-# upstream Seeed-Studio URL when running outside CI.
-if [[ -n "${GITHUB_REPOSITORY:-}" ]]; then
+# Compute the current repository's project Pages URL (works for forks).
+# REPO_URL overrides the default for a local preview or a custom domain.
+if [[ -n "${REPO_URL:-}" ]]; then
+    PAGES_URL="${REPO_URL%/}/"
+elif [[ -n "${GITHUB_REPOSITORY:-}" ]]; then
     OWNER="${GITHUB_REPOSITORY%%/*}"
     REPO_NAME="${GITHUB_REPOSITORY#*/}"
     PAGES_URL="https://${OWNER}.github.io/${REPO_NAME}/"

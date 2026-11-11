@@ -256,7 +256,7 @@ while [[ $# -gt 0 ]]; do
             shift
             ;;
         --minimal)
-            BUILD_MINIMAL="yes"
+            BUILD_MINIMAL="no"
             BUILD_DESKTOP="no"
             shift
             ;;

@@ -224,6 +224,7 @@ OTA_MODE=${manifest_mode}
 OTA_ENCRYPTED=${CRYPTROOT_ENABLE:-no}
 BOARD=${BOARD}
 RELEASE=${RELEASE}
+IMAGE_VARIANT=${OTA_IMAGE_VARIANT}
 BRANCH=${BRANCH}
 VERSION=${IMAGE_VERSION:-"${REVISION}"}
 KERNEL=${KERNEL_VERSION:-"${IMAGE_INSTALLED_KERNEL_VERSION}"}
@@ -235,6 +236,22 @@ EOF
     if [[ -n "${OTA_MIN_RUNTIME_VERSION:-}" ]]; then
         echo "MIN_RUNTIME_VERSION=${OTA_MIN_RUNTIME_VERSION}" >> "${ota_mode_file}"
     fi
+    # Capacity stamps consumed by the device-side gate (ota_check_payload_
+    # capacity). Only stamped when the build-side measurement succeeded, so
+    # absence means a pre-gate package -- which the device skips with a
+    # warning instead of refusing.
+    if [[ "${OTA_ROOTFS_BYTES:-}" =~ ^[0-9]+$ ]]; then
+        echo "ROOTFS_BYTES=${OTA_ROOTFS_BYTES}" >> "${ota_mode_file}"
+    fi
+    if [[ "${OTA_BOOT_BYTES:-}" =~ ^[0-9]+$ ]]; then
+        echo "BOOT_BYTES=${OTA_BOOT_BYTES}" >> "${ota_mode_file}"
+    fi
+    # Boot payload shape: "itb" (raw FIT, dd'd verbatim -- the device-side
+    # capacity gate compares it 1:1 instead of with the extract margin) or
+    # "tar" (ext4 boot tree). Tells the gate the shape without a tar scan.
+    case "${OTA_BOOT_KIND:-}" in
+        itb|tar) echo "BOOT_KIND=${OTA_BOOT_KIND}" >> "${ota_mode_file}" ;;
+    esac
     # OTA_BOOT_REFRESH=0 defers the built-in boot-partition refresh to the
     # package hook (recovery/hooks/boot-atomic-swap.sh); absent or 1 keeps the
     # legacy built-in extract (docs/10-ota-package-formats.md).
@@ -680,10 +697,23 @@ function ota_create_payload_archives() {
     local payload_id
 
     if [[ "${ota_security_mode}" == "secure-boot-encrypted-rootfs" ]]; then
-        # raw-FIT/secure is Phase 2 (deferred design doc); no payload-id flow
+        # Raw-FIT/secure payload (v0.8): the boot payload is the signed
+        # boot.itb instead of a boot partition tree, but the identity flow
+        # below is shared with plain -- without a PAYLOAD_ID the device side
+        # refuses the package (recovery_check_package_metadata) and no
+        # campaign can ever arm. The boot tree for the identity is the FIT
+        # itself (hardlinked -- same bytes, no multi-MB copy); clearing
+        # boot_partition skips the ext4 staging, the boot.tar seal and the
+        # /boot stamp in the shared tail (the applier dd-writes boot.itb to
+        # the raw partition via write_raw_boot_itb, and the health service
+        # skips the /boot marker check on raw-fit layouts).
+        OTA_BOOT_KIND="itb"
         ota_copy_secure_boot_itb "${ota_temp_dir}" || return 1
-        rm -rf "${boot_mount}"
-        return 0
+        mkdir -p "${boot_stage}"
+        ln "${ota_temp_dir}/boot.itb" "${boot_stage}/boot.itb" || return 1
+        boot_partition=""
+    else
+        OTA_BOOT_KIND="tar"
     fi
 
     # 1) stage the boot content (recovery/ and lost+found/ excluded) so the
@@ -748,6 +778,29 @@ function ota_create_payload_archives() {
             display_alert "OTA payload identity" "failed to stamp boot payload-id" "warn"
     fi
 
+    # 5) capacity stamps for the device-side gate (ota_check_payload_capacity
+    #    in common.sh): apparent-size bytes of exactly what gets extracted
+    #    into each target partition. The rootfs measure mirrors the payload
+    #    tar's --one-file-system + exclude list (run from inside MOUNT with
+    #    the same relative patterns), so it cannot count the mounted boot
+    #    partition or runtime mounts, and it uses the same measurement basis
+    #    as the build framework's rootfs_size (partition sizing and the gate
+    #    agree on units). The boot measure is the staged boot tree itself
+    #    (the raw-FIT hardlink counts once).
+    OTA_ROOTFS_BYTES="$(
+        cd "${MOUNT}" 2>/dev/null && du --apparent-size -sb --one-file-system \
+            --exclude="./dev" --exclude="./proc" --exclude="./sys" \
+            --exclude="./tmp" --exclude="./run" . | tail -n1 | cut -f1
+    )"
+    OTA_BOOT_BYTES="$(
+        cd "${boot_stage}" 2>/dev/null && du --apparent-size -sb . | tail -n1 | cut -f1
+    )"
+    [[ "${OTA_ROOTFS_BYTES:-}" =~ ^[0-9]+$ ]] ||
+        display_alert "OTA capacity stamps" "rootfs size measurement failed; ROOTFS_BYTES stamp omitted" "warn"
+    [[ "${OTA_BOOT_BYTES:-}" =~ ^[0-9]+$ ]] ||
+        display_alert "OTA capacity stamps" "boot size measurement failed; BOOT_BYTES stamp omitted" "warn"
+    display_alert "OTA capacity stamps" "rootfs=${OTA_ROOTFS_BYTES:-?}B boot=${OTA_BOOT_BYTES:-?}B" "info"
+
     rm -rf "${boot_mount}" "${boot_stage}"
     display_alert "OTA payload identity" "PAYLOAD_ID=${payload_id}" "info"
 }
@@ -805,11 +858,16 @@ function pre_umount_final_image__901_create_ota_payload_pkg() {
 
     display_alert "pre_umount_final_image__901 Extracting partition images from loop device" "Detecting and extracting partitions from ${LOOP}" "info"
 
-    # Determine OTA security mode.
+    # Determine OTA security mode. The FIT-payload branch is keyed on the
+    # LAYOUT (ota_raw_boot_enabled), not on ota_secure_boot_encrypted_
+    # rootfs_enabled: the auto-decrypt + OP-TEE flavor (profile
+    # "recovery secure-rootfs") also carries a raw boot + recovery partition
+    # pair and a signed FIT, and classifying it as ext4-boot made hook 901
+    # mount the raw partition (or die at 'PAYLOAD_ID not computed').
     local ota_security_mode="plain"
-    if ota_secure_boot_encrypted_rootfs_enabled; then
+    if ota_raw_boot_enabled && ota_encrypted_rootfs_enabled; then
         ota_security_mode="secure-boot-encrypted-rootfs"
-        display_alert "Secure boot and auto ota enabled" "Using FIT image workflow" "info"
+        display_alert "Raw-FIT encrypted OTA" "Using FIT image workflow" "info"
     elif ota_encrypted_rootfs_enabled; then
         ota_security_mode="encrypted-rootfs"
         display_alert "Encrypted auto-decrypt OTA" "Non-secure boot mode: use mapper rootfs and package plain boot partition" "info"

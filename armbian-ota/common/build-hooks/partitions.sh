@@ -12,8 +12,25 @@ function ota_require_gpt_partition_table() {
     fi
 }
 
+# Raw-FIT boot layout (signed kernel FIT on a raw partition). BOOT_RAW_MODE is
+# exported by rk-secure-boot's pre_prepare_partitions__050 hook, but its
+# visibility in later hooks is timing-dependent across the host/container
+# hook rounds (observed: the same build produced the rescue partition in one
+# run and silently dropped it in the next). Re-derive the mode from the same
+# inputs rk_autodecrypt_fit_boot_required() uses -- RK_SECURE_UBOOT_ENABLE,
+# or auto-decrypt with the OP-TEE bootchain -- so every caller agrees.
+# KEEP IN SYNC with rk_secure-disk-encryption/build-hooks/common.sh.
 function ota_raw_boot_enabled() {
-    [[ "${BOOT_RAW_MODE:-}" == "yes" ]]
+    if [[ "${BOOT_RAW_MODE:-}" == "yes" ]]; then
+        return 0
+    fi
+    if [[ "${RK_SECURE_UBOOT_ENABLE:-}" == "yes" ]]; then
+        return 0
+    fi
+    if [[ "${CRYPTROOT_ENABLE:-}" == "yes" && "${RK_AUTO_DECRYP:-}" == "yes" && "${RK_OPTEE_BOOT_ENABLE:-}" == "yes" ]]; then
+        return 0
+    fi
+    return 1
 }
 
 function ota_install_overlayroot_dependencies() {
@@ -30,8 +47,10 @@ function ota_get_default_partition_sizes() {
 
     OTA_BOOT_SIZE=${OTA_BOOT_SIZE:-512}
     OTA_SECURITY_SIZE=${OTA_SECURITY_SIZE:-4}
-    # +20% for ext4 metadata and OTA growth; runtime writes go to userdata.
-    OTA_ROOTFS_SIZE=${OTA_ROOTFS_SIZE:-$((((rootfs_size + extra_rootfs_mib) * 120 + 99) / 100))}
+    # +50% headroom for ext4 metadata and OTA growth; runtime writes go to
+    # userdata. With the device-side capacity gate (110% extract margin)
+    # this accepts payloads up to ~36% larger than the flashed rootfs.
+    OTA_ROOTFS_SIZE=${OTA_ROOTFS_SIZE:-$((((rootfs_size + extra_rootfs_mib) * 150 + 99) / 100))}
     # Pre-resize floor; armbian-resize-userdata expands it on first boot.
     OTA_USERDATA_SIZE=${OTA_USERDATA_SIZE:-512}
 

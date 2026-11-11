@@ -1,0 +1,87 @@
+name: "Preflight checks"
+description: "Probe secrets and validate preflight conditions before the build"
+inputs:
+  secure_boot:
+    description: "Whether secure-boot is enabled (validates secure-boot secrets)"
+    required: false
+    type: string
+    default: "false"
+  rclone_config:
+    description: "RCLONE_CONFIG secret content (required for image publication)"
+    required: true
+    type: string
+  private_key_pem:
+    description: "PRIVATE_KEY_PEM secret content"
+    required: false
+    type: string
+  dev_crt:
+    description: "DEV_CRT secret content"
+    required: false
+    type: string
+  cryptroot_passphrase:
+    description: "CRYPTROOT_PASSPHRASE secret content"
+    required: false
+    type: string
+
+runs:
+  using: "composite"
+  steps:
+    - name: Setup rclone (seeed-storage OneDrive remote)
+      uses: ./.github/actions/setup-onedrive
+      with:
+        rclone_config: ${{ inputs.rclone_config }}
+
+    - name: Require and check the OneDrive mirror
+      shell: bash
+      env:
+        RCLONE_CONFIG_CONTENT: ${{ inputs.rclone_config }}
+      run: |
+        set -euo pipefail
+        [ -n "$RCLONE_CONFIG_CONTENT" ] \
+          || { echo "::error::RCLONE_CONFIG is required — images are published only to OneDrive; no GitHub Release asset fallback exists."; exit 1; }
+        # RCLONE_CONFIG is a file path, not the config contents. setup-onedrive
+        # writes the secret above; use that file for these rclone invocations.
+        export RCLONE_CONFIG="$HOME/.config/rclone/rclone.conf"
+        # Reachability gate only — the per-owner namespace
+        # (armbian/<owner>/images) may not exist yet on a fresh mirror;
+        # the build's uploads create it.
+        if ! error="$(rclone lsf seeed-storage: --dirs-only --contimeout 15s 2>&1 >/dev/null)"; then
+          echo "::error::rclone cannot reach seeed-storage: — refresh the RCLONE_CONFIG token or check the remote."
+          printf '%s\n' "$error" >&2
+          exit 1
+        fi
+        echo "OneDrive remote OK. Quota:"
+        rclone about seeed-storage: 2>/dev/null | grep -E 'Total:|Free:|Trashed:' || true
+
+    - name: Validate secure-boot secrets
+      if: inputs.secure_boot == 'true'
+      shell: bash
+      env:
+        PRIVATE_KEY_PEM: ${{ inputs.private_key_pem }}
+        DEV_CRT: ${{ inputs.dev_crt }}
+        CRYPTROOT_PASSPHRASE: ${{ inputs.cryptroot_passphrase }}
+      run: |
+        set -euo pipefail
+        fail=0
+        err() { echo "::error::$1"; fail=1; }
+
+        [ -n "$PRIVATE_KEY_PEM" ] || err "secret PRIVATE_KEY_PEM is empty (secure_boot selected)"
+        [ -n "$DEV_CRT" ]        || err "secret DEV_CRT is empty (secure_boot selected)"
+        [ "${#CRYPTROOT_PASSPHRASE}" -eq 64 ] \
+          || err "CRYPTROOT_PASSPHRASE must be exactly 64 chars, got ${#CRYPTROOT_PASSPHRASE}"
+        if [ -n "$PRIVATE_KEY_PEM" ]; then
+          printf '%s\n' "$PRIVATE_KEY_PEM" | openssl rsa -check -noout >/dev/null 2>&1 \
+            || err "PRIVATE_KEY_PEM is not a parsable RSA key"
+        fi
+        if [ -n "$DEV_CRT" ]; then
+          printf '%s\n' "$DEV_CRT" | openssl x509 -noout >/dev/null 2>&1 \
+            || err "DEV_CRT is not a parsable x509 certificate"
+        fi
+        if [ -n "$PRIVATE_KEY_PEM" ] && [ -n "$DEV_CRT" ]; then
+          key_pub=$(printf '%s\n' "$PRIVATE_KEY_PEM" | openssl rsa -pubout 2>/dev/null | openssl md5)
+          crt_pub=$(printf '%s\n' "$DEV_CRT" | openssl x509 -pubkey -noout 2>/dev/null | openssl md5)
+          [ "$key_pub" = "$crt_pub" ] || err "PRIVATE_KEY_PEM does not match DEV_CRT"
+        fi
+
+        [ "$fail" -eq 0 ] || exit 1
+        echo "Secure-boot secrets present and well-formed."

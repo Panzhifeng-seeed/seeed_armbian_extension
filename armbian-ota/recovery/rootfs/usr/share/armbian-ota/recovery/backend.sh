@@ -23,14 +23,14 @@ OTA_STATE_FILE="${OTA_STATE_DIR}/ota-state.env"
 # keeps the CPU pass under the eMMC I/O floor, no --long (decompressor window
 # cost outweighs the ratio for a once-per-device archive).
 OTA_BACKUP_ZSTD_LEVEL="${OTA_BACKUP_ZSTD_LEVEL:--3}"
-OTA_SPACE_MARGIN_MB="${OTA_SPACE_MARGIN_MB:-512}"
+# OTA_SPACE_MARGIN_MB lives in common.sh (shared with the A/B space gate).
 OTA_BACKUP_BOOT_EXCLUDES="recovery lost+found"
 
 . /usr/share/armbian-ota/fwenv.sh
 
 recovery_require_tools() {
     ota_require_runtime tar sha256sum mount umount mountpoint sed grep awk \
-        find stat df zstd fw_setenv fw_printenv
+        find stat df zstd fw_setenv fw_printenv findmnt blockdev
 }
 
 recovery_require_transaction_store() {
@@ -84,23 +84,16 @@ ota_compute_payload_id() {
 
 recovery_check_package_metadata() {
     local package_path="$1" force="$2"
-    local payload_id board release
+    local payload_id
 
     payload_id="$(package_env_get_value "PAYLOAD_ID" || true)"
     [ -n "${payload_id}" ] ||
         error_exit "OTA package carries no PAYLOAD_ID (built by a pre-v0.8 toolchain); refused"
 
-    board="$(package_env_get_value "BOARD" || true)"
-    release="$(package_env_get_value "RELEASE" || true)"
-    local sys_board sys_release
-    sys_board="$(recovery_system_field BOARD)"
-    sys_release="$(recovery_system_field RELEASE)"
-    if [ -n "${sys_board}" ] && [ -n "${board}" ] && [ "${board}" != "${sys_board}" ]; then
-        error_exit "OTA package BOARD mismatch: package=${board}, device=${sys_board}"
-    fi
-    if [ -n "${sys_release}" ] && [ -n "${release}" ] && [ "${release}" != "${sys_release}" ]; then
-        error_exit "OTA package RELEASE mismatch: package=${release}, device=${sys_release} (cross-release OTA is not supported)"
-    fi
+    # BOARD/RELEASE matching moved to the shared ota_check_board_release gate
+    # (invoked from the CLI check_ota_pkg pre-flight) so both modes enforce the
+    # identical contract; this backend keeps only the recovery-specific
+    # identity checks below.
 
     local installed_id
     installed_id="$(state_get INSTALLED_ID)"
@@ -111,44 +104,9 @@ recovery_check_package_metadata() {
     OTA_CLI_PAYLOAD_ID="${payload_id}"
 }
 
-# KIND=full implies BOTH archives exist in the package and BOTH are covered
-# by their checksum files. This is an explicit assertion, not a side effect
-# of checksum verification: a broken build can drop boot.tar together with
-# its checksum entry and still verify green (section 15.2).
-recovery_assert_dual_tar() {
-    local package_path="$1"
-    local fmt member
-    fmt="$(package_env_get_value "PAYLOAD_FORMAT" || echo "gz")"
-    case "${fmt}" in
-        xz)   fmt="xz" ;;
-        zstd) fmt="zst" ;;
-        zst)  fmt="zst" ;;
-        gz)   fmt="gz" ;;
-        *) error_exit "Unknown PAYLOAD_FORMAT: ${fmt}" ;;
-    esac
-
-    local listing
-    listing="$(tar -tf "${package_path}" 2>/dev/null)" ||
-        error_exit "Cannot list OTA package: ${package_path}"
-
-    # final tarball members carry no ./ prefix (find -printf '%P'), but be
-    # liberal and accept both spellings
-    for member in "rootfs.tar.${fmt}" "boot.tar.${fmt}"; do
-        printf '%s\n' "${listing}" | grep -qxE "(\./)?${member//./\\.}" ||
-            error_exit "KIND=full package is missing ${member} (dual-tar assertion failed)"
-    done
-    for member in "rootfs.sha256" "boot.sha256"; do
-        printf '%s\n' "${listing}" | grep -qxE "(\./)?${member//./\\.}" ||
-            error_exit "OTA package is missing checksum file ${member} (dual-tar assertion failed)"
-    done
-
-    # each checksum file must actually cover its archive
-    local root_sha boot_sha
-    root_sha="$(tar -xOf "${package_path}" "rootfs.sha256" 2>/dev/null | grep -c "rootfs.tar.${fmt}" || true)"
-    [ "${root_sha:-0}" -ge 1 ] || error_exit "rootfs.sha256 does not cover rootfs.tar.${fmt}"
-    boot_sha="$(tar -xOf "${package_path}" "boot.sha256" 2>/dev/null | grep -c "boot.tar.${fmt}" || true)"
-    [ "${boot_sha:-0}" -ge 1 ] || error_exit "boot.sha256 does not cover boot.tar.${fmt}"
-}
+# KIND=full dual-payload assertion moved to the shared ota_assert_dual_payload
+# (common.sh) so both modes enforce it; see the comments there for the
+# payload-shape matrix (boot.tar.<fmt> vs boot.itb, plaintext vs .enc).
 
 recovery_check_space() {
     local package_path="$1" want_backup="$2"
@@ -157,13 +115,21 @@ recovery_check_space() {
     avail="$(df -B1 --output=avail "${RECOVERY_OVERLAY_BACKING_DIR}" 2>/dev/null | tail -n1)"
     [ -n "${avail}" ] || { log_warn "cannot read userdata free space; skipping space gate"; return 0; }
 
-    pkg_size="$(stat -c%s "${package_path}")"
+    # a failed stat must not silently collapse need to 0 (gate bypass)
+    pkg_size="$(stat -c%s "${package_path}" 2>/dev/null)" ||
+        error_exit "Cannot determine OTA package size: ${package_path}"
     need=$((pkg_size * 2))   # outer package + extracted payload members
 
     if [ "${want_backup}" = "yes" ]; then
-        local lower_used boot_used
+        local lower_used boot_used raw_dev fit_sz
         lower_used="$(du -sb /media/root-ro 2>/dev/null | awk '{print $1}')"
-        boot_used="$(du -sb /boot 2>/dev/null | awk '{print $1}')"
+        raw_dev="$(recovery_raw_boot_dev || true)"
+        if [ -n "${raw_dev}" ] && fit_sz="$(recovery_fit_size_bytes "${raw_dev}" 2>/dev/null)"; then
+            # raw-FIT layout: the backup stages exactly the FIT bytes
+            boot_used="${fit_sz}"
+        else
+            boot_used="$(du -sb /boot 2>/dev/null | awk '{print $1}')"
+        fi
         backup_est=$(( ${lower_used:-0} + ${boot_used:-0} ))
         need=$((need + backup_est))
     fi
@@ -173,6 +139,25 @@ recovery_check_space() {
         error_exit "Insufficient userdata space: avail=${avail}, need=${need} (payload=${pkg_size}, backup_est=${backup_est}, margin=${margin}); use --no-backup to drop the backup term"
     fi
     log_info "Space gate: avail=${avail} need=${need} (backup_est=${backup_est})"
+}
+
+# Capacity gate targets: the rootfs partition this system runs from is the one
+# the initramfs will reflash (recovery_lower_source resolves the LUKS mapper on
+# encrypted builds -- its size IS the usable ext4 capacity, so no header
+# allowance is needed). Boot target is the raw FIT partition on raw-boot
+# layouts, else the /boot partition mount.
+recovery_check_capacity() {
+    local root_dev boot_dev
+
+    root_dev="$(recovery_lower_source)"
+    [ -b "${root_dev}" ] || {
+        log_warn "Capacity gate: rootfs source ${root_dev:-<empty>} is not a block device; skipping"
+        return 0
+    }
+    if ! boot_dev="$(recovery_raw_boot_dev 2>/dev/null)"; then
+        boot_dev="$(findmnt -n -o SOURCE /boot 2>/dev/null || true)"
+    fi
+    ota_check_payload_capacity "${root_dev}" "${boot_dev:-}" 0 0
 }
 
 # ===== staging (15.2 steps 2 and 4) ==========================================
@@ -243,12 +228,51 @@ recovery_stage_payload() {
 
 # ===== lazy backup creation (15.2 step 3, 15.3) ==============================
 
+# The raw-FIT (secure boot) boot partition: PARTLABEL=boot on the boot disk
+# whose blkid TYPE is empty (no filesystem -- the signed FIT sits at offset
+# 0). Empty on ext4-boot layouts. Fail-closed: without a boot-disk anchor no
+# device is returned at all -- cloned disks duplicate PARTLABEL=boot and an
+# unscoped first match would read (and on rollback flash) the WRONG disk's
+# FIT; the caller then falls through to the ext4 branch and fails loudly.
+recovery_raw_boot_dev() {
+    local disk dev fstype
+
+    disk="$(fw_env_boot_disk "$(recovery_lower_source)" 2>/dev/null || true)"
+    [ -n "${disk}" ] || return 1
+    for dev in $(blkid -t PARTLABEL=boot -o device 2>/dev/null); do
+        fstype="$(blkid -s TYPE -o value "${dev}" 2>/dev/null || true)"
+        [ -z "${fstype}" ] || continue
+        case "${dev}" in
+            "${disk}"p[0-9]*) ;;
+            *) continue ;;
+        esac
+        printf '%s\n' "${dev}"
+        return 0
+    done
+    return 1
+}
+
+# Exact FIT payload size from the FDT header: 4-byte magic (d00dfeed) then a
+# 4-byte big-endian totalsize. Reading the whole partition instead would
+# stage gigabytes of stale padding into the backup.
+recovery_fit_size_bytes() {
+    local dev="$1" header
+
+    header="$(dd if="${dev}" bs=8 count=1 2>/dev/null | od -An -tx1 | tr -d ' \n')"
+    [ "${#header}" -ge 16 ] || return 1
+    [ "${header:0:8}" = "d00dfeed" ] || return 1
+    printf '%d' "0x${header:8:8}" 2>/dev/null || return 1
+}
+
 recovery_backup_valid_structurally() {
     local dir="$1"
 
     [ -d "${dir}" ] || return 1
     [ -f "${dir}/payload.env" ] || return 1
     [ -f "${dir}/rootfs.tar.zst" ] || return 1
+    # raw-FIT backups carry the signed FIT at the top level instead of a
+    # boot.tar (the restore path is BOOT_ITB/write_raw_boot_itb)
+    [ -f "${dir}/boot.itb" ] && return 0
     [ -f "${dir}/boot.tar.zst" ] || return 1
     return 0
 }
@@ -270,10 +294,10 @@ recovery_create_backup() {
     local boot_mnt="/boot"
     local work="${OTA_STAGING_DIR}/backup.$$"
     local lower_dev board release kernel version root_tar boot_tree payload_id
+    local raw_boot_dev fit_size
 
     recovery_require_transaction_store
     [ -d "${lower_mnt}" ] || error_exit "Backup source ${lower_mnt} missing (overlayroot lower not mounted)"
-    mountpoint -q "${boot_mnt}" || error_exit "Backup source ${boot_mnt} is not a mounted boot partition"
 
     lower_dev="$(recovery_lower_source)"
     board="$(recovery_system_field BOARD)"
@@ -304,38 +328,77 @@ recovery_create_backup() {
     fi
     (cd "${work}" && sha256sum rootfs.tar.zst > rootfs.sha256)
 
-    # 2) boot staging tree: everything except recovery/ and lost+found/
+    # 2) boot staging -- two flavors by layout (section 15.1):
+    #    raw-FIT (secure boot): the signed FIT read from the raw boot
+    #      partition at its exact FDT-header size lands at the payload
+    #      directory TOP LEVEL -- a restore campaign resolves BOOT_ITB from
+    #      there and only that path rewrites the raw partition. No boot.tar
+    #      is produced: it would hold a second copy of the signed FIT (the
+    #      tree hash needs one entry, satisfied by a hardlink) and zstd
+    #      cannot compress a signed blob anyway.
+    #    ext4: everything on the boot partition except recovery/ and
+    #      lost+found/ packs into boot.tar.zst (the upper layer survives
+    #      OTA, so lower+boot reproduces the full pre-OTA system on restore)
     boot_tree="${work}/boot-tree"
     mkdir -p "${boot_tree}"
-    if ! (
-        # pipefail: cp -a succeeds on whatever files it received, so a failed
-        # find would otherwise stage a partial boot tree unnoticed.
-        set -o pipefail
-        (cd "${boot_mnt}" && find . -mindepth 1 -maxdepth 1 \( ${excludes} \) -prune -o -print0) |
-            (cd "${boot_mnt}" && xargs -0 -r cp -a --target-directory="${boot_tree}")
-    ); then
-        rm -rf "${work}"
-        error_exit "Backup: failed to stage boot tree"
+    raw_boot_dev="$(recovery_raw_boot_dev || true)"
+    if [ -n "${raw_boot_dev}" ]; then
+        fit_size="$(recovery_fit_size_bytes "${raw_boot_dev}")" || {
+            rm -rf "${work}"
+            error_exit "Backup: no FIT header on raw boot partition ${raw_boot_dev}"
+        }
+        log_info "Reading FIT (${fit_size} bytes) from ${raw_boot_dev} -> boot.itb"
+        if ! dd if="${raw_boot_dev}" of="${work}/boot.itb" \
+                 bs=512 count=$(( (fit_size + 511) / 512 )) status=none; then
+            rm -rf "${work}"
+            error_exit "Backup: failed to read FIT from ${raw_boot_dev}"
+        fi
+        truncate -s "${fit_size}" "${work}/boot.itb" || {
+            rm -rf "${work}"
+            error_exit "Backup: failed to trim boot.itb to FIT size"
+        }
+        ln "${work}/boot.itb" "${boot_tree}/boot.itb" || {
+            rm -rf "${work}"
+            error_exit "Backup: failed to link boot.itb into the identity tree"
+        }
+    else
+        mountpoint -q "${boot_mnt}" || error_exit "Backup source ${boot_mnt} is not a mounted boot partition"
+        if ! (
+            # pipefail: cp -a succeeds on whatever files it received, so a failed
+            # find would otherwise stage a partial boot tree unnoticed.
+            set -o pipefail
+            (cd "${boot_mnt}" && find . -mindepth 1 -maxdepth 1 \( ${excludes} \) -prune -o -print0) |
+                (cd "${boot_mnt}" && xargs -0 -r cp -a --target-directory="${boot_tree}")
+        ); then
+            rm -rf "${work}"
+            error_exit "Backup: failed to stage boot tree"
+        fi
+        [ -f "${boot_tree}/Image" ] || {
+            rm -rf "${work}"
+            error_exit "Backup: boot staging tree missing Image"
+        }
     fi
-    [ -f "${boot_tree}/Image" ] || {
-        rm -rf "${work}"
-        error_exit "Backup: boot staging tree missing Image"
-    }
 
-    # 3) identity, marker, boot.tar.zst
+    # 3) identity, then the boot checksum target (tar on ext4 layouts, the
+    #    FIT itself on raw-FIT ones -- ota_payload_verify_full just runs
+    #    sha256sum -c boot.sha256, which covers whichever file this names)
     payload_id="$(ota_compute_payload_id "${work}/rootfs.tar.zst" "${boot_tree}" \
         "${board}" "${release}" "${kernel}" "${version}")"
-    printf '%s\n' "${payload_id}" > "${boot_tree}/payload-id"
-    if ! (
-        # pipefail: same truncated-stream concern as the rootfs pack above.
-        set -o pipefail
-        tar --numeric-owner -C "${boot_tree}" -cf - . |
-            zstd -q ${OTA_BACKUP_ZSTD_LEVEL} -T0 -o "${work}/boot.tar.zst"
-    ); then
-        rm -rf "${work}"
-        error_exit "Backup: failed to pack boot tree"
+    if [ -n "${raw_boot_dev}" ]; then
+        (cd "${work}" && sha256sum boot.itb > boot.sha256)
+    else
+        printf '%s\n' "${payload_id}" > "${boot_tree}/payload-id"
+        if ! (
+            # pipefail: same truncated-stream concern as the rootfs pack above.
+            set -o pipefail
+            tar --numeric-owner -C "${boot_tree}" -cf - . |
+                zstd -q ${OTA_BACKUP_ZSTD_LEVEL} -T0 -o "${work}/boot.tar.zst"
+        ); then
+            rm -rf "${work}"
+            error_exit "Backup: failed to pack boot tree"
+        fi
+        (cd "${work}" && sha256sum boot.tar.zst > boot.sha256)
     fi
-    (cd "${work}" && sha256sum boot.tar.zst > boot.sha256)
 
     # 4) metadata
     {
@@ -376,8 +439,24 @@ recovery_arm_env() {
     disk="$(fw_env_ensure_config "${lower_dev}")" ||
         error_exit "Cannot resolve boot disk for fw_env (anchor=${lower_dev:-none})"
 
-    fw_env_set_multi "ota_in_progress=1" "ota_boot_next=recovery" ||
-        error_exit "Failed to arm U-Boot env (ota_in_progress=1, ota_boot_next=recovery); transaction NOT started"
+    # Encrypted systems root the fs rescue branch on the mapper (no
+    # LABEL=armbi_root exists on a LUKS container)
+    ota_system_encrypted && OTA_RESCUE_ROOT_DEFAULT="/dev/mapper/armbian-root"
+
+    # A bad-CRC blob must not take the two-key arming write: fw_setenv then
+    # starts from an EMPTY env and ships a valid-CRC blob without bootcmd or
+    # the boot scripts (the exact write pattern fwenv.sh forbids) -- the
+    # post-apply reboot would route non-transactionally and the campaign
+    # could be rolled back after a successful apply. Rebuild the full
+    # routing set instead.
+    if fw_env_crc_bad; then
+        log_warn "U-Boot env CRC bad at arm time; rebuilding full routing set before arming"
+        fw_env_write_routing_set "1" "recovery" ||
+            error_exit "Failed to rebuild routing env (bad CRC); transaction NOT started"
+    else
+        fw_env_set_multi "ota_in_progress=1" "ota_boot_next=recovery" ||
+            error_exit "Failed to arm U-Boot env (ota_in_progress=1, ota_boot_next=recovery); transaction NOT started"
+    fi
     log_info "U-Boot env armed on ${disk}: ota_in_progress=1, ota_boot_next=recovery"
 }
 
@@ -394,12 +473,17 @@ recovery_start_ota() {
     recovery_require_transaction_store
     assert_package_mode_matches "${package_path}" "recovery"
 
-    # 1) cheap checks
+    # 1) cheap checks, cheapest first: space (df + a du walk of the live
+    # rootfs) and capacity (blockdev reads) are seconds-cheap, while the
+    # dual-payload assertion must stream-decompress the whole multi-GB
+    # package to list its members -- it runs last so a device-side
+    # shortfall (the more common field failure) fails fast.
     recovery_check_package_metadata "${package_path}" "${force}"
-    recovery_assert_dual_tar "${package_path}"
     local want_backup="yes"
     [ -n "${no_backup}" ] && want_backup="no"
     recovery_check_space "${package_path}" "${want_backup}"
+    recovery_check_capacity
+    ota_assert_dual_payload "${package_path}"
 
     # 2) full verification into staging (fail-fast, zero side effects)
     recovery_stage_payload "${package_path}"

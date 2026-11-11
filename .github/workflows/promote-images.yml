@@ -1,0 +1,62 @@
+name: "Images - Release"
+
+# slots.json drives candidate promotion and mirror retention.
+# Re-runs recover partial promotions; Releases outlive mirror trees.
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: images-mirror
+  cancel-in-progress: false
+
+jobs:
+  promote:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    outputs:
+      tag: ${{ steps.reconcile.outputs.tag }}
+      target_repo: ${{ steps.reconcile.outputs.target_repo }}
+      mode: ${{ steps.reconcile.outputs.mode }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup rclone (seeed-storage OneDrive remote)
+        uses: ./.github/actions/setup-onedrive
+        with:
+          rclone_config: ${{ secrets.RCLONE_CONFIG }}
+
+      - name: Reconcile slots, trees, and Releases
+        id: reconcile
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_GH_TOKEN || github.token }}
+          GH_REPO: ${{ github.repository_owner }}/armbian-build
+          RCLONE_CONFIG: ${{ runner.home }}/.config/rclone/rclone.conf
+          HISTORY_DEPTH: "1"
+        run: |
+          export RCLONE_CONFIG="$HOME/.config/rclone/rclone.conf"
+          python3 .github/scripts/reconcile-image-mirror.py
+
+  pages:
+    name: Deploy the images page (build-source repo's Pages)
+    needs: promote
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Deploy images page
+        uses: ./.github/actions/deploy-pages
+        with:
+          tag: ${{ needs.promote.outputs.tag }}
+          repo: ${{ needs.promote.outputs.target_repo }}
+          release_repo: ${{ needs.promote.outputs.target_repo }}
+          rclone_config: ${{ secrets.RCLONE_CONFIG }}
+          pages_token: ${{ secrets.PAGES_TARGET_TOKEN }}
+          gh_token: ${{ secrets.RELEASE_GH_TOKEN || github.token }}

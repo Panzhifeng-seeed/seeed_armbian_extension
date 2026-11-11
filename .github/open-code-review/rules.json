@@ -1,0 +1,38 @@
+{
+  "include": [
+    "**/*"
+  ],
+  "exclude": [
+    "**/*.{udeb,rpm,o,ko,a,so,bin,dtb,dtbo,elf,img,iso,pyc}",
+    "**/*.so.*",
+    "**/*.{gz,xz,zst,bz2,zip,7z,png,jpg,jpeg,gif,ico,pdf}",
+    "**/__pycache__/**"
+  ],
+  "rules": [
+    {
+      "path": ".github/patchs/**",
+      "rule": "rules/runtime.md",
+      "merge_system_rule": false
+    },
+    {
+      "path": ".github/**",
+      "rule": "rules/ci.md",
+      "merge_system_rule": false
+    },
+    {
+      "path": "{armbian-ota,initramfs}/**",
+      "rule": "rules/ota.md",
+      "merge_system_rule": false
+    },
+    {
+      "path": "rk_secure-disk-encryption/**",
+      "rule": "rules/secure-boot.md",
+      "merge_system_rule": false
+    },
+    {
+      "path": "**",
+      "rule": "rules/runtime.md",
+      "merge_system_rule": false
+    }
+  ]
+}
