@@ -102,9 +102,13 @@ function ota_ab_write_complete_initial_env() {
     # distro machinery (6.1 legacy chains) or bootstd (v5 vendor tree) —
     # the same tolerant pairing the extraction sanity check accepts. Checked
     # on the default env itself, so the initial env's own bootflow text
-    # cannot mask a default-env-side gap.
+    # cannot mask a default-env-side gap. Third shape: the secure-boot tier
+    # narrows the v5 bootcmd to the raw-partition boot_fit leg alone
+    # (FIT_SIGNATURE via rockchip-common.h), same acceptance as the
+    # extraction sanity check.
     grep -q '^distro_bootcmd=' "${default_env}" ||
-        grep -q 'bootflow' "${default_env}" || {
+        grep -q 'bootflow' "${default_env}" ||
+        grep -q '^bootcmd=boot_fit' "${default_env}" || {
         rm -f "${merged_env}"
         return 1
     }
