@@ -144,6 +144,12 @@ copy_exec_first /usr/sbin /usr/sbin/mke2fs /sbin/mke2fs
 copy_ota_lib state.sh
 copy_ota_lib find-userdata.sh
 copy_ota_lib fwenv.sh
+# Per-image v5-only routing-env token, optional by design (absent on 6.1-era
+# trees -- see fwenv.sh); source it into the initramfs copy so the rescue
+# routing rebuild keeps the token too.
+if [ -f /usr/share/armbian-ota/uboot-tree.env ]; then
+    copy_ota_lib uboot-tree.env
+fi
 copy_recovery_initramfs_lib log.sh
 copy_recovery_initramfs_lib device.sh
 copy_recovery_initramfs_lib payload.sh

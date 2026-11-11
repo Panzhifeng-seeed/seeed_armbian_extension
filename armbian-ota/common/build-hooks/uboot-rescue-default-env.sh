@@ -43,8 +43,19 @@ function post_family_config__seeed_ota_stage_uboot_rescue_default_env() {
 	# exist in that form. Skip (and heal a copy staged by pre-gating builds)
 	# until a bootstd-shaped rescue default is designed.
 	if [[ "${boot_patch_dir}" == "legacy/u-boot-rockchip-v5" ]]; then
+		# The distro-form default-env patch can neither apply nor make sense
+		# on the bootstd tree (see below). The routing env still needs one v5
+		# piece: fit_get_blob() picks the partition from PART_BOOT /
+		# plat_boot_mode() only, so the routing env's "setenv boot_fit_part
+		# boot|recovery" override (raw boot for normal, PARTLABEL=recovery
+		# for rescue) has no effect without this fit.c hook.
+		local v5_patch_src="${extension_common_root}/patches/seeed-ota-bootfit-part-v5.patch"
+		[[ -f "${v5_patch_src}" ]] ||
+			exit_with_error "seeed-ota" "bootfit-part v5 patch missing: ${v5_patch_src}"
 		rm -f "${target_patch}"
-		display_alert "seeed-ota" "rescue-default-env: u-boot-rockchip-v5 is bootstd-form, patch not staged" "info"
+		mkdir -p "${target_dir}"
+		cp -f "${v5_patch_src}" "${target_dir}/seeed-ota-bootfit-part-v5.patch"
+		display_alert "seeed-ota" "staged boot_fit_part v5 patch -> ${target_dir}" "info"
 		return 0
 	fi
 

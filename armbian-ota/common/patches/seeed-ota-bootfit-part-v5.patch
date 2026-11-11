@@ -1,0 +1,34 @@
+Subject: [PATCH] rockchip: fit: let the OTA routing env pick the boot_fit partition
+
+The transactional OTA routing env (uboot-env-prefill.sh / fwenv.sh,
+"KEEP IN SYNC" trio) points boot_fit at the raw boot partition for
+normal boot and at the PARTLABEL=recovery partition for rescue via
+"setenv boot_fit_part <name>". The 2017.09 vendor tree honours that
+variable; the v5 (v2025.04) fit_get_blob() only selects between
+PART_BOOT and PART_RECOVERY from plat_boot_mode(), so the rescue fit
+branch could never find its partition. Read the override from the
+environment and fall back to the boot-mode based selection.
+
+Staged for legacy/u-boot-rockchip-v5 builds only
+(uboot-rescue-default-env.sh); the distro-form trees keep the
+boot-mode based selection.
+---
+--- a/arch/arm/mach-rockchip/fit.c
++++ b/arch/arm/mach-rockchip/fit.c
+@@ -151,8 +151,15 @@
+ 	char *part_name = PART_BOOT;
+ 	void *fit, *fdt;
+ 	int blk_num;
++	const char *boot_fit_part;
+ 
+-	if (plat_boot_mode() == BOOT_MODE_RECOVERY) {
++	/* Seeed OTA routing: the transactional env points boot_fit at the raw
++	 * boot or PARTLABEL=recovery partition explicitly; keep the boot-mode
++	 * based selection as the fallback when the override is unset. */
++	boot_fit_part = env_get("boot_fit_part");
++	if (boot_fit_part && *boot_fit_part) {
++		part_name = (char *)boot_fit_part;
++	} else if (plat_boot_mode() == BOOT_MODE_RECOVERY) {
+ 		if (!ab_is_enabled() || ab_can_find_recovery_part())
+ 			part_name = PART_RECOVERY;
+ 	}

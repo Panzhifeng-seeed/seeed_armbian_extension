@@ -177,10 +177,25 @@ fw_env_set_multi() {
 # scripts: on a bad-CRC boot the default bootcmd lands in Rescue, whose CRC
 # reconciliation rebuilds this full set before returning to normal.
 
+# plymouth.ignore-serial-consoles in the fit-branch bootargs is needed only
+# on the v5 bootstd tree: raw-FIT (secure) images there take cmdline solely
+# from the env, and plymouthd otherwise attaches ttyFIQ0 alongside getty.
+# The 6.1 vendor tree boots fine without it and shares this file once
+# fit/vendor-next merges to main, so the token comes from a per-image stamp
+# (uboot-tree.env, written by the runtime install hook on vendor-next
+# builds only, and copied into the initramfs next to this file); a missing
+# stamp means no token -- the 6.1-preserving default. Same trust domain as
+# sourcing this file itself.
+OTA_ENV_PLYMOUTH_TOKEN=""
+if [ -f /usr/share/armbian-ota/uboot-tree.env ]; then
+    # shellcheck disable=SC1091
+    . /usr/share/armbian-ota/uboot-tree.env
+fi
+OTA_ENV_PLYMOUTH_TOKEN="${OTA_ENV_PLYMOUTH_TOKEN:-}"
 OTA_ENV_NORMAL_BOOT_FS='setenv prefix /; ext4load ${devtype} ${devnum}:1 ${scriptaddr} /boot.scr && source ${scriptaddr}'
-OTA_ENV_NORMAL_BOOT_FIT='setenv boot_fit_part boot; setenv bootargs "console=ttyFIQ0 root=/dev/mapper/armbian-root rw rootwait rootfstype=ext4 armbian.bootdev=${devtype} armbian.bootdevnum=${devnum}"; boot_fit'
+OTA_ENV_NORMAL_BOOT_FIT="setenv boot_fit_part boot; setenv bootargs \"console=ttyFIQ0 ${OTA_ENV_PLYMOUTH_TOKEN}root=/dev/mapper/armbian-root rw rootwait rootfstype=ext4 armbian.bootdev=\${devtype} armbian.bootdevnum=\${devnum}\"; boot_fit"
 OTA_ENV_NORMAL_BOOT='run ota_normal_boot_fs || run ota_normal_boot_fit'
-OTA_ENV_RESCUE_BOOT_FIT='setenv boot_fit_part recovery; setenv bootargs "root=/dev/mapper/armbian-root rw rootwait rootfstype=ext4 console=ttyFIQ0,1500000n8 armbian.bootdev=${devtype} armbian.bootdevnum=${devnum} armbian.ota_role=recovery"; boot_fit'
+OTA_ENV_RESCUE_BOOT_FIT="setenv boot_fit_part recovery; setenv bootargs \"root=/dev/mapper/armbian-root rw rootwait rootfstype=ext4 console=ttyFIQ0,1500000n8 ${OTA_ENV_PLYMOUTH_TOKEN}armbian.bootdev=\${devtype} armbian.bootdevnum=\${devnum} armbian.ota_role=recovery\"; boot_fit"
 OTA_ENV_RESCUE_BOOT='run ota_rescue_boot_fs || run ota_rescue_boot_fit || run distro_bootcmd'
 OTA_ENV_BOOTCMD='if test -z "${devtype}"; then run rkimg_bootdev; fi; if test "${ota_in_progress}" = "1"; then if test "${ota_boot_next}" = "normal"; then setenv ota_boot_next recovery; if saveenv; then run ota_normal_boot; fi; run ota_rescue_boot; else run ota_rescue_boot; fi; else run ota_normal_boot; run ota_rescue_boot; fi'
 
