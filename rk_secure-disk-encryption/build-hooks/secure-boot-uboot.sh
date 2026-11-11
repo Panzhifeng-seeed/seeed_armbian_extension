@@ -71,14 +71,25 @@ function rk_secure_boot_stage_bl32_binman() {
     # Binman packs the TEE through the @tee-SEQ split-elf template, which only
     # accepts ELF images or OP-TEE v1 binaries. The Rockchip bl32 blobs are raw
     # AArch64 images with no header, so prepend a synthetic OP-TEE v1 header:
-    # binman derives load/entry (0x48400000) from it and drops the header when
-    # emitting the tee-1 node, so SPL copies exactly the raw blob to the load
-    # address — the same memory image the vendor fit generator flow produces.
-    # TEE_OFFSET matches the vendor fit_args.sh default (0x08400000) on top of
-    # the 0x40000000 DRAM base.
+    # binman derives load/entry from it and drops the header when emitting the
+    # tee-1 node, so SPL copies exactly the raw blob to the load address — the
+    # same memory image the vendor fit generator flow produces. That flow
+    # places the TEE at CFG_SYS_SDRAM_BASE + fit_args.sh TEE_OFFSET (0x08400000,
+    # the BL32 ADDR in both SoCs' official RKTRUST ini), so the DRAM base is
+    # per-SoC: rk3576 maps DRAM at 0x40000000 (tee validated at 0x48400000 on
+    # hardware); rk3588 maps it at 0x0 (SPL reports "Ram: 0x00000000 -
+    # 0xf0000000") — loading the 3588 tee at 0x48400000 hangs BL31 at
+    # "Initializing BL32" (first 3588 secure board boot, 2026-11-11).
     local blob_path="$1"
     local tee_bin="$2"
-    local load_addr=$((0x40000000 + 0x08400000))
+    local platform="$3"
+    local dram_base
+    case "${platform}" in
+        rk3576) dram_base=0x40000000 ;;
+        rk3588) dram_base=0x0 ;;
+        *) exit_with_error "No TEE DRAM base mapping for platform" "${platform}" ;;
+    esac
+    local load_addr=$((dram_base + 0x08400000))
     local blob_size
 
     blob_size="$(stat -c %s "${blob_path}")" ||
@@ -131,7 +142,7 @@ function rk_secure_boot_prepare_tee_bin() {
         if [[ ! -f "${bl32_path}" ]]; then
             exit_with_error "BL32 blob missing" "${bl32_path}"
         fi
-        rk_secure_boot_stage_bl32_binman "${bl32_path}" "${uboot_workdir}/tee.bin"
+        rk_secure_boot_stage_bl32_binman "${bl32_path}" "${uboot_workdir}/tee.bin" "${platform}"
     else
         bl32_path="${SRC}/cache/sources/rkbin-tools/${bl32_blob}"
         if [[ ! -f "${bl32_path}" ]]; then
