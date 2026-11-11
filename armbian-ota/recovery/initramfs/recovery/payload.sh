@@ -274,7 +274,8 @@ ota_validate_recovery_state() {
     # rejects the mismatched pairs before anything is touched). The .enc blob
     # stays staged after the phase-1 decrypt, so its presence still marks an
     # encrypted package here.
-    if [ -f "${OTA_DIR}/rootfs.tar.xz.enc" ] || [ -f "${OTA_DIR}/rootfs.tar.gz.enc" ]; then
+    if [ -f "${OTA_DIR}/rootfs.tar.xz.enc" ] || [ -f "${OTA_DIR}/rootfs.tar.gz.enc" ] ||
+       [ -f "${OTA_DIR}/rootfs.tar.zst.enc" ]; then
         pkg_encrypted=1
     else
         pkg_encrypted=0
